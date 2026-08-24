@@ -78,18 +78,11 @@ frappe.ui.form.on("Slot Opening", {
 
 		if (frm.doc.docstatus === 1 && frm.doc.slot_master) {
 			frappe.call({
-				method: 'custom_batch_planning.custom_batch_planning.doctype.slot_opening.slot_opening.get_sct_details',
-				args: { slot_master: frm.doc.slot_master },
+				method: 'custom_batch_planning.custom_batch_planning.doctype.slot_opening.slot_opening.get_slot_opening_usage',
+				args: { slot_opening: frm.doc.name },
 				callback: function (sct_r) {
-					let sct_map = {};
-					(sct_r.message || []).forEach(function (d) {
-						sct_map[d.date] = parseInt(d.batches_planned) || 0;
-					});
-
-					let has_remaining = (frm.doc.slot_booking || []).some(function (row) {
-						let booked = parseInt(row.planning_capacity) || 0;
-						let planned = sct_map[row.slot_booking_date] || 0;
-						return booked > planned;
+					let has_remaining = (sct_r.message || []).some(function (d) {
+						return (parseInt(d.remaining) || 0) > 0;
 					});
 
 					let today = frappe.datetime.nowdate();
@@ -435,7 +428,7 @@ function calculate_totals(frm) {
 
 function fetch_sct_remaining(frm) {
 	if (!frm.doc.slot_master) return;
-	if (frm.doc.docstatus === 1) return; // submitted docs are locked — skip recalculation entirely
+	if (frm.doc.docstatus === 1) return;
 	frappe.call({
 		method: "custom_batch_planning.custom_batch_planning.doctype.slot_opening.slot_opening.get_sct_details",
 		args: { slot_master: frm.doc.slot_master },

@@ -19,7 +19,7 @@ frappe.ui.form.on("Batches Planned", {
 								method: "frappe.client.get_list",
 								args: {
 									doctype: "Material Allocation",
-									filters: { batches_planned: frm.doc.name },
+									filters: { batch_planning: frm.doc.batch_planning },
 									fields: ["name", "allocation_status"],
 									order_by: "creation desc",
 								},
@@ -233,7 +233,6 @@ function empty_state(icon, msg) {
 function open_new_ma(frm) {
 	frappe.new_doc("Material Allocation", {
 		batch_planning: frm.doc.batch_planning,
-		batches_planned: frm.doc.name,
 		employee_function: frm.doc.employee_function,
 		project_id: frm.doc.project,
 		project_name: frm.doc.project_name,

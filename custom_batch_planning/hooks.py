@@ -256,7 +256,6 @@ fixtures = [
                 "custom_batch_no",
                 "custom_employee_function",
                 "custom_employee_functions",
-                "custom_material_allocation",
                 "custom_batch_planning",
                 "custom_enable_manufacturing_batch",
                 "custom_batch_planning_no",
@@ -279,26 +278,49 @@ fixtures = [
 
 doctype_js = {
     "Material Request": "public/js/material_request_prefill.js",
-    "Stock Entry": "public/js/stock_entry_ma_status.js",
     "Purchase Order": "public/js/purchase_order_consolidation.js"
 }
 
+# Tagging enforcement is wired on `validate`, never `before_insert`.
+#
+# before_insert fires once, at creation. A document created before the cutover
+# as a draft and edited or amended afterwards would keep its blanks forever.
+# validate runs on every save and on submit (frappe runs validate then
+# before_save / before_submit), so the rule holds for the whole life of the
+# document, which is the only way the post-cutover guarantee is actually a
+# guarantee.
+#
+# On Stock Entry this also puts enforcement ahead of map_stock_entry_fields,
+# which is a before_save hook: the copy-down then has valid values to copy.
 doc_events = {
     "Material Request": {
-        "validate": "custom_batch_planning.api.pr_integration.validate_material_request"
+        "validate": [
+            "custom_batch_planning.api.pr_integration.validate_material_request",
+            "custom_batch_planning.api.tagging_enforcement.validate_tagging",
+        ]
     },
     "Purchase Order": {
-        "validate": "custom_batch_planning.api.po_integration.validate_purchase_order",
+        "validate": [
+            "custom_batch_planning.api.po_integration.validate_purchase_order",
+            "custom_batch_planning.api.tagging_enforcement.validate_tagging",
+        ],
         "before_insert": "custom_batch_planning.hooks_po_grn.set_batch_planning_id_on_po"
     },
     "Purchase Receipt": {
+        "validate": "custom_batch_planning.api.tagging_enforcement.validate_tagging",
         "before_save": "custom_batch_planning.api.pr_integration.map_purchase_receipt_fields",
         "before_insert": "custom_batch_planning.hooks_po_grn.set_batch_planning_id_on_grn",
         "on_submit": "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.sync_batch_expiry_from_grn"
     },
     "Stock Entry": {
+        "validate": "custom_batch_planning.api.tagging_enforcement.validate_tagging",
         "before_save": "custom_batch_planning.api.pr_integration.map_stock_entry_fields",
-        "on_submit": "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.on_stock_entry_submit"
+        "on_submit": [
+            "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.on_stock_entry_submit",
+            # Flips the linked allocation to "Stock Entry Done". Server-side so it
+            # fires for every submit, not only when the form happens to be open.
+            "custom_batch_planning.custom_batch_planning.doctype.material_allocation.material_allocation.stock_entry_on_submit",
+        ]
     },
     "Purchase Invoice": {
         "validate": "custom_batch_planning.api.pr_integration.map_purchase_invoice_fields"

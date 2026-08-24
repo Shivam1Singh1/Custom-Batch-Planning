@@ -3,7 +3,6 @@ import frappe
 def run():
     print("--- DRY RUN: Backfilling Stock Entry and SLE dimensions ---")
     
-    # Find all submitted Stock Entries that have custom_batch_planning_no
     stock_entries = frappe.db.sql("""
         SELECT name, custom_material_allocation, custom_batch_planning_no, project 
         FROM `tabStock Entry` 
@@ -19,7 +18,6 @@ def run():
     updated_sle = 0
     
     for se in stock_entries:
-        # Check Stock Entry Details where batch_planning_id or project is missing
         details = frappe.db.sql("""
             SELECT name, item_code, batch_planning_id, project 
             FROM `tabStock Entry Detail` 
@@ -27,7 +25,6 @@ def run():
             AND (batch_planning_id IS NULL OR batch_planning_id = '' OR project IS NULL OR project = '')
         """, (se.name,), as_dict=True)
         
-        # Check Stock Ledger Entries where batch_planning_id or project is missing
         sles = frappe.db.sql("""
             SELECT name, item_code, batch_planning_id, project, warehouse, actual_qty
             FROM `tabStock Ledger Entry` 
@@ -39,7 +36,6 @@ def run():
         if not details and not sles:
             continue
             
-        # Determine the correct batch_planning_id and project
         ma_project = None
         if se.custom_material_allocation:
             ma_project = frappe.db.get_value("Material Allocation", se.custom_material_allocation, "project_id")

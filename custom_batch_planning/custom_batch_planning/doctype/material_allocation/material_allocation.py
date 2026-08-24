@@ -8,6 +8,7 @@ class MaterialAllocation(Document):
     def validate(self):
         self.validate_planning_window()
         self.check_batch_planning_allocation_limit()
+        self.check_global_free_stock_limit()
         for item in self.material_allocation:
             qty_requested = flt(item.allocate_qty)
             bom_qty = flt(item.quantity_required)
@@ -15,28 +16,130 @@ class MaterialAllocation(Document):
 
             if qty_requested < 1:
                 frappe.throw(
-                    f"Row #{item.idx}: Qty Requested for item {item.item_code} "
-                    f"must be at least 1. Please remove this row or enter a valid "
-                    f"quantity — 0 is not allowed."
+                    f"Row #{item.idx} ({item.item_code}): Qty Requested must be at least 1."
                 )
 
             if qty_requested > stock:
                 frappe.throw(
-                    f"Row #{item.idx}: Stock Available ({stock}) is less than Qty Requested ({qty_requested}) for item {item.item_code}."
+                    f"Row #{item.idx} ({item.item_code}): Qty Requested {qty_requested} exceeds Stock Available {stock}."
                 )
             if qty_requested > bom_qty:
                 frappe.throw(
-                    f"Row #{item.idx}: Qty Requested ({qty_requested}) cannot exceed Consolidated BOM Qty ({bom_qty}) for item {item.item_code}."
+                    f"Row #{item.idx} ({item.item_code}): Qty Requested {qty_requested} exceeds BOM Qty {bom_qty}."
                 )
             if qty_requested != bom_qty and not (item.reason or "").strip():
                 frappe.throw(
-                    f"Row #{item.idx}: Reason is mandatory because Qty Requested ({qty_requested}) differs from Consolidated BOM Qty ({bom_qty}) for item {item.item_code}."
+                    f"Row #{item.idx} ({item.item_code}): Reason is required when Qty Requested {qty_requested} differs from BOM Qty {bom_qty}."
                 )
+
+    def clear_source_split(self):
+        """Blank the source breakdown when it cannot be derived server-side.
+
+        The four split fields are read-only on the form but still arrive in the
+        payload, so leaving whatever the client sent in place would present an
+        unverified split as if the server had computed it. Zero is the honest
+        answer when there is no pool to compute against.
+        """
+        for item in self.material_allocation:
+            item.local_free_qty = 0
+            item.global_free_qty = 0
+            item.local_allocated_qty = 0
+            item.global_allocated_qty = 0
+
+    def check_global_free_stock_limit(self):
+        """Re-read the free pools at save time, enforce local-first, refuse to
+        over-issue.
+
+        Allocation priority is enforced here, not in the UI: this batch's own
+        free stock is consumed in full before any global stock is touched, and
+        the resulting local/global breakdown is written back onto every row.
+        Requested 100 against 40 local and 80 global saves as 40 local + 60
+        global; requested 30 against the same pools saves as 30 local + 0
+        global. Whatever split the client sent is discarded.
+
+        The confirmation dialog on the Batch Planning form is advisory only: it
+        reflects the pools as they stood when Material Planning was last run. By
+        the time this document is saved another allocation may have consumed
+        the same units, so the figure the user agreed to cannot be trusted and
+        is deliberately not sent back to the server.
+
+        Rows are locked FOR UPDATE while the pools are read, so two allocations
+        racing for the last units serialise instead of both passing.
+
+        This document is excluded from the totals it is being checked against —
+        on a re-save it is already in the table, and counting it would make it
+        compete with itself.
+        """
+        from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
+            free_stock_figures,
+            split_local_first,
+        )
+        from custom_batch_planning.custom_batch_planning.doctype.batch_planning_settings.batch_planning_settings import (
+            get_stock_cutover_datetime,
+        )
+
+        if self.allocation_status in ("Deallocated", "Stock Entry Done"):
+            return
+
+        if not self.batch_planning or not self.employee_function:
+            self.clear_source_split()
+            return
+
+        cutover = get_stock_cutover_datetime()
+
+        warehouse = self.get_warehouse()
+        if not warehouse:
+            self.clear_source_split()
+            return
+
+        rows_by_item = {}
+        for item in self.material_allocation:
+            if flt(item.allocate_qty) <= 0:
+                item.local_allocated_qty = 0
+                item.global_allocated_qty = 0
+                continue
+            rows_by_item.setdefault(item.item_code, []).append(item)
+
+        for item_code, rows in rows_by_item.items():
+            figures = free_stock_figures(
+                item_code,
+                warehouse,
+                self.employee_function,
+                self.project_id,
+                self.batch_planning,
+                cutover,
+                exclude_parent=self.name,
+                for_update=True,
+            )
+
+            split = split_local_first(
+                [flt(r.allocate_qty) for r in rows],
+                figures["bp_free_stock"],
+                figures["other_free_stock"],
+            )
+
+            if split["shortfall"] > 0:
+                requested = split["requested"]
+                available = split["capacity"]
+                rows_note = f" across {len(rows)} rows" if len(rows) > 1 else ""
+                frappe.throw(
+                    f"<b>{item_code}</b>: need <b>{requested}</b>{rows_note}, "
+                    f"only <b>{available}</b> free "
+                    f"(this batch {split['local_free']} + global {split['global_free']}).",
+                    title="Insufficient Free Stock",
+                )
+
+            for row, row_split in zip(rows, split["rows"]):
+                row.local_free_qty = split["local_free"]
+                row.global_free_qty = split["global_free"]
+                row.local_allocated_qty = row_split["from_local"]
+                row.global_allocated_qty = row_split["from_global"]
+                row.stock_available = split["capacity"]
 
     def check_batch_planning_allocation_limit(self):
         if not self.batch_planning:
             return
-            
+
         for item in self.material_allocation:
             query = """
                 SELECT IFNULL(SUM(mai.allocate_qty), 0)
@@ -55,8 +158,8 @@ class MaterialAllocation(Document):
             
             if total > flt(item.quantity_required):
                 frappe.throw(
-                    f"Row #{item.idx}: Total allocate quantity ({total}) exceeds quantity_required ({item.quantity_required}) for item {item.item_code}. "
-                    f"(Already allocated across other documents: {already_allocated}, Requested here: {item.allocate_qty})"
+                    f"Row #{item.idx} ({item.item_code}): total allocated {total} exceeds required {item.quantity_required} "
+                    f"({already_allocated} already allocated elsewhere + {item.allocate_qty} here)."
                 )
 
     def validate_planning_window(self):
@@ -76,7 +179,7 @@ class MaterialAllocation(Document):
             d = getdate(latest_date[0][0])
             if d < getdate(today()):
                 frappe.throw(
-                    f"Material Allocation cannot be saved because the planning window for Batch Planning <b>{self.batch_planning}</b> (last date: {d}) has already passed."
+                    f"Planning window for <b>{self.batch_planning}</b> closed on {d}."
                 )
 
     @frappe.whitelist()
@@ -88,10 +191,10 @@ class MaterialAllocation(Document):
         3. Fallback for non-batch items.
         """
         if self.workflow_state != "Approved":
-            frappe.throw("Allocation can only be performed when the document is in 'Approved' state.")
+            frappe.throw("Allocation requires the document to be Approved.")
 
         if self.docstatus == 2:
-            frappe.throw("Allocation cannot be performed on Cancelled documents.")
+            frappe.throw("Document is cancelled.")
 
         warehouse = self.get_warehouse()
         if not warehouse:
@@ -147,29 +250,41 @@ class MaterialAllocation(Document):
 
         return True
 
+    def get_linked_stock_entry(self):
+        """
+        Returns the live Stock Entry linked to this allocation, or None.
+
+        The link lives on this side (`stock_entry`) rather than on Stock Entry,
+        so a cancelled Stock Entry leaves a stale pointer behind. Treat a
+        cancelled Stock Entry as no link at all and clear it, which is what
+        frees the allocation up for a fresh transfer.
+        """
+        if not self.stock_entry:
+            return None
+
+        se = frappe.db.get_value(
+            "Stock Entry", self.stock_entry, ["name", "docstatus"], as_dict=True
+        )
+        if not se or se.docstatus == 2:
+            self.db_set("stock_entry", None, update_modified=False)
+            return None
+
+        return se
+
     @frappe.whitelist()
     def deallocate(self):
         if self.docstatus == 2:
-            frappe.throw("Cannot deallocate a Cancelled document.")
+            frappe.throw("Document is cancelled.")
 
-        existing_se = frappe.db.get_value(
-            "Stock Entry",
-            {"custom_material_allocation": self.name, "docstatus": ["!=", 2]},
-            ["name", "docstatus"],
-            as_dict=True,
-        )
+        existing_se = self.get_linked_stock_entry()
         if existing_se:
             if existing_se.docstatus == 1:
                 frappe.throw(
-                    f"⛔ Deallocation blocked. Stock Entry <b>{existing_se.name}</b> has already been "
-                    f"submitted. Items have been sent for manufacturing. "
-                    f"Please cancel the Stock Entry first."
+                    f"Stock Entry <b>{existing_se.name}</b> is submitted. Cancel it first."
                 )
             else:
                 frappe.throw(
-                    f"⛔ Deallocation blocked. A Draft Stock Entry <b>{existing_se.name}</b> exists "
-                    f"for this allocation. Please cancel or delete the Draft Stock Entry first, "
-                    f"or submit it if the transfer should proceed."
+                    f"Draft Stock Entry <b>{existing_se.name}</b> exists. Delete or submit it first."
                 )
 
         for item in self.material_allocation:
@@ -186,6 +301,103 @@ class MaterialAllocation(Document):
         self.save_allocation_log("Deallocated")
 
         return True
+
+    @frappe.whitelist()
+    def create_stock_entry(self):
+        """
+        Builds the Material Transfer Stock Entry for this allocation and records
+        it on `stock_entry`.
+
+        This runs server-side rather than via frappe.new_doc on the client
+        because the link is now held on this document: the Stock Entry name only
+        exists once it has been inserted, so the client cannot stamp it.
+        Inserting here also makes the one-Stock-Entry-per-allocation guard
+        atomic instead of a read-then-create race.
+
+        The draft is inserted with mandatory checks off. Stock Entry carries two
+        required fields this allocation has no answer for — custom_line_of_business
+        (labelled "Cost Centre") and custom_cost_centre (labelled "Segment") —
+        and guessing a value for either would be worse than leaving them blank:
+        they are an accounting decision belonging to whoever posts the transfer.
+        Without the flag the insert failed outright with "Value missing for
+        Stock Entry: Cost Centre", so no draft could be created at all.
+
+        Nothing is bypassed permanently. The flag lives on this one in-memory
+        document; the Stock Entry that gets loaded when the user opens it has no
+        such flag, so both fields are enforced normally the moment they try to
+        save or submit it — which is exactly where they are meant to be filled.
+        """
+        if self.docstatus != 1:
+            frappe.throw("Submit the Material Allocation first.")
+
+        existing_se = self.get_linked_stock_entry()
+        if existing_se:
+            frappe.throw(
+                f"Stock Entry <b>{existing_se.name}</b> already exists. Only one is allowed."
+            )
+
+        ef = frappe.get_doc("Employee Function", self.employee_function)
+        from_warehouse = next(
+            (r.store_warehouse for r in (ef.table_bukm or []) if r.store_warehouse), None
+        )
+        if not from_warehouse:
+            frappe.throw(
+                f"No store warehouse found in Employee Function {self.employee_function}."
+            )
+        to_warehouse = next(
+            (r.lab_warehouse for r in (ef.table_szrn or []) if r.lab_warehouse), None
+        )
+
+        bom_no = None
+        if self.batch_planning:
+            bom_rows = frappe.get_all(
+                "Batch Planning Detail",
+                filters={
+                    "parent": self.batch_planning,
+                    "parenttype": "Batch Planning",
+                    "bom_list": ["is", "set"],
+                },
+                fields=["bom_list"],
+                order_by="idx asc",
+                limit=1,
+            )
+            bom_no = bom_rows[0].bom_list if bom_rows else None
+
+        se = frappe.new_doc("Stock Entry")
+        se.stock_entry_type = "Material Transfer"
+        se.custom_batch_planning_no = self.batch_planning
+        se.from_warehouse = from_warehouse
+        se.to_warehouse = to_warehouse
+        se.project = self.project_id
+        se.custom_employee_functions = self.employee_function
+        if bom_no:
+            se.bom_no = bom_no
+            se.from_bom = 1
+
+        for row in self.material_allocation:
+            qty = flt(row.allocate_qty)
+            if qty <= 0:
+                continue
+            se.append("items", {
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "qty": qty,
+                "uom": row.uom,
+                "s_warehouse": from_warehouse,
+                "t_warehouse": to_warehouse,
+                "conversion_factor": 1,
+                "transfer_qty": qty,
+                "batch_planning_id": self.batch_planning,
+                "project": self.project_id,
+            })
+
+        if not se.items:
+            frappe.throw("No allocated quantities to transfer.")
+
+        se.insert(ignore_mandatory=True)
+        self.db_set("stock_entry", se.name, update_modified=False)
+
+        return se.name
 
     def save_allocation_log(self, status):
         """Logs the allocation/deallocation activity to 'Material Allocation Log'."""
@@ -257,7 +469,7 @@ class MaterialAllocation(Document):
             counter = str(count + 1).zfill(2)
             self.name = f"MA-{self.batch_planning}-{counter}"
         else:
-            frappe.throw("Batch Planning is required to generate document name.")
+            frappe.throw("Batch Planning is required.")
 
     def get_warehouse(self):
         ef_doc = frappe.get_doc("Employee Function", self.employee_function)
@@ -315,32 +527,31 @@ def ma_get_allocated_qty(item_code, employee_function, batch_planning, project, 
     if not warehouse:
         return {"free_stock": 0, "allocated_qty": 0}
 
-    stock_query = """
-        SELECT SUM(actual_qty) FROM `tabStock Ledger Entry`
-        WHERE item_code = %s AND warehouse = %s
-        AND batch_planning_id = %s AND project = %s AND is_cancelled = 0
-    """
-    total_stock = flt(frappe.db.sql(stock_query, (item_code, warehouse, batch_planning, project))[0][0])
+    from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
+        free_stock_figures,
+    )
+    from custom_batch_planning.custom_batch_planning.doctype.batch_planning_settings.batch_planning_settings import (
+        get_stock_cutover_datetime,
+    )
 
-    query = """
-        SELECT SUM(mai.qty_allocated)
-        FROM `tabMaterial Allocation Item` mai
-        INNER JOIN `tabMaterial Allocation` ma ON ma.name = mai.parent
-        WHERE mai.item_code = %s AND ma.employee_function = %s
-        AND ma.batch_planning = %s
-        AND ma.allocation_status NOT IN ('Deallocated', 'Stock Entry Done')
-        AND ma.docstatus != 2
-    """
-    args = [item_code, employee_function, batch_planning]
-    if exclude_parent:
-        query += " AND ma.name != %s"
-        args.append(exclude_parent)
+    figures = free_stock_figures(
+        item_code,
+        warehouse,
+        employee_function,
+        project,
+        batch_planning,
+        get_stock_cutover_datetime(),
+        exclude_parent=exclude_parent,
+    )
 
-    allocated_qty = flt(frappe.db.sql(query, tuple(args))[0][0])
+    local_free = max(flt(figures["bp_free_stock"]), 0.0)
+    global_free = max(flt(figures["other_free_stock"]), 0.0)
 
     return {
-        "free_stock": total_stock - allocated_qty,
-        "allocated_qty": allocated_qty,
+        "local_free": local_free,
+        "global_free": global_free,
+        "free_stock": local_free + global_free,
+        "allocated_qty": flt(figures["bp_allocated"]),
     }
 
 @frappe.whitelist()
@@ -412,16 +623,25 @@ def get_item_batch_expiry(item_codes):
 
     return result
 
+def stock_entry_on_submit(doc, method=None):
+    """doc_events hook for Stock Entry on_submit."""
+    on_stock_entry_submit(doc.name)
+
+
 @frappe.whitelist()
 def on_stock_entry_submit(stock_entry_name):
     """
     Called when Stock Entry linked to a Material Allocation is submitted.
     Updates allocation_status to 'Stock Entry Done'.
+
+    The allocation owns the link (`stock_entry`), so this resolves the
+    Material Allocation by reverse lookup rather than reading a field off
+    the Stock Entry.
     """
     ma_name = frappe.db.get_value(
-        "Stock Entry",
-        stock_entry_name,
-        "custom_material_allocation"
+        "Material Allocation",
+        {"stock_entry": stock_entry_name},
+        "name",
     )
     if not ma_name:
         return

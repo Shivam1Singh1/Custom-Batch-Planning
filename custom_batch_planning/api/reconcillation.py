@@ -41,7 +41,13 @@ def get_monthly_reconciliation(year=None, month=None, employee_function=None):
         LEFT JOIN `tabPurchase Receipt Item` pri ON pri.parent = pr.name
         LEFT JOIN `tabPurchase Invoice`    pi  ON pi.custom_batch_planning_no = bp.batch_planning
                                                AND pi.docstatus IN (0, 1)
-        LEFT JOIN `tabMaterial Allocation` ma  ON ma.batches_planned          = bp.name
+        -- Joined on the Batch Planning link, not on the old comma-joined
+        -- "Planned Batch References" text field. That field held a list like
+        -- "SO-...-PD-07, SO-...-PD-06, ...", so `= bp.name` could never match a
+        -- single Batches Planned and ma_count was silently 0 for every row.
+        -- A Material Allocation is raised per Batch Planning anyway, covering
+        -- all of its batches, so this is the link that was always meant.
+        LEFT JOIN `tabMaterial Allocation` ma  ON ma.batch_planning           = bp.batch_planning
                                                AND ma.docstatus = 1
         LEFT JOIN `tabStock Entry`         se  ON se.custom_batch_planning_no = bp.batch_planning
                                                AND se.stock_entry_type = 'Material Issue'

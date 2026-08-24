@@ -5,7 +5,6 @@ from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_r
 from frappe.utils import today
 
 def execute():
-    # Setup test variables
     import frappe.model.document
     frappe.model.document.Document._validate_links = lambda self: None
     frappe.flags.ignore_links = True
@@ -16,7 +15,6 @@ def execute():
     
     from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import get_material_planning_data
     
-    # Get the first item from the Batch Planning's Material Planning Data
     data = get_material_planning_data(bp_name)
     if isinstance(data, dict):
         data = list(data.values())
@@ -66,7 +64,6 @@ def execute():
     
     mr = frappe.new_doc("Material Request")
     
-    # Fetch an existing MR to copy mandatory fields
     any_mr = frappe.db.get_value("Material Request", {"docstatus": 1}, "name")
     existing_mr = frappe.get_doc("Material Request", any_mr)
     mr.custom_stages = existing_mr.get('custom_stages')
@@ -125,7 +122,6 @@ def execute():
         po.items[0].conversion_factor = 1.0
         po.items[0].warehouse = warehouse
         
-        # Setting some required fields that might be missing
         po.schedule_date = today()
         
         po.flags.ignore_mandatory = True
@@ -150,14 +146,13 @@ def execute():
         pr.items[0].rejected_qty = 0.0
         pr.items[0].accepted_qty = 10.0
         pr.items[0].conversion_factor = 1.0
-        pr.items[0].batch_planning_id = bp_name # Map explicitly if needed
+        pr.items[0].batch_planning_id = bp_name
         pr.items[0].warehouse = warehouse
         pr.project = project
         
         pr.flags.ignore_mandatory = True
         pr.insert()
         
-        # Determine the correct workflow state for Approval if workflow is active
         workflows = frappe.get_all('Workflow', filters={'document_type': 'Purchase Receipt', 'is_active': 1}, fields=['name'])
         
         if frappe.db.get_value("Item", item_code, "has_batch_no"):
@@ -192,7 +187,6 @@ def execute():
             workflow_name = workflows[0].name
             transitions = frappe.get_all('Workflow Transition', filters={'parent': workflow_name}, fields=['state', 'next_state', 'action'], order_by="idx")
             
-            # Start from Draft
             current_state = pr.workflow_state or "Draft"
             target_state = "Approved By Store Head"
             
@@ -228,7 +222,6 @@ def check_status(item_code, bp_name):
     
     item_row = None
     if data:
-        # data might be a list of lists of dicts
         for row in data:
             if isinstance(row, list):
                 for sub_row in row:

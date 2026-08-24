@@ -6,10 +6,18 @@ from frappe.utils import flt, today
 class BatchesPlanned(Document):
 
     def on_trash(self):
-        if frappe.db.exists("Material Allocation", {"batches_planned": self.name}):
+        if frappe.db.exists(
+            "Material Allocation",
+            {
+                "batch_planning": self.batch_planning,
+                "allocation_status": ["not in", ("Deallocated", "Stock Entry Done")],
+                "docstatus": ["!=", 2],
+            },
+        ):
             frappe.throw(
                 f"Cannot delete Batches Planned <b>{self.name}</b>. "
-                f"Material Allocation exists for it."
+                f"A live Material Allocation exists for Batch Planning "
+                f"<b>{self.batch_planning}</b>."
             )
 
         if frappe.flags.get("skip_sct_decrement"):

@@ -96,7 +96,6 @@ def map_stock_entry_fields(doc, method=None):
     """
     consolidate_items_table(doc)
 
-    # Ensure custom dimensions are copied to the target fields so incoming SLEs get the correct values
     for item in doc.items:
         if item.batch_planning_id and not item.to_batch_planning_id:
             item.to_batch_planning_id = item.batch_planning_id

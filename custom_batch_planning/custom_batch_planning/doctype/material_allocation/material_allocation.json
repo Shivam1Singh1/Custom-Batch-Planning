@@ -14,7 +14,7 @@
     "mr_created",
     "amended_from",
     "batch_planning",
-    "batches_planned",
+    "stock_entry",
     "material_allocation_table_section",
     "material_allocation"
   ],
@@ -81,13 +81,6 @@
       "reqd": 1
     },
     {
-      "fieldname": "batches_planned",
-      "fieldtype": "Data",
-      "in_list_view": 1,
-      "label": "Planned Batch References",
-      "read_only": 1
-    },
-    {
       "allow_on_submit": 1,
       "default": "0",
       "fieldname": "mr_created",
@@ -95,6 +88,16 @@
       "hidden": 1,
       "label": "MR Created",
       "read_only": 1
+    },
+    {
+      "allow_on_submit": 1,
+      "fieldname": "stock_entry",
+      "fieldtype": "Link",
+      "label": "Stock Entry",
+      "no_copy": 1,
+      "options": "Stock Entry",
+      "read_only": 1,
+      "search_index": 1
     },
     {
       "fieldname": "material_allocation_table_section",
@@ -112,7 +115,7 @@
   "index_web_pages_for_search": 1,
   "is_submittable": 1,
   "links": [],
-  "modified": "2026-05-05 07:00:00.000000",
+  "modified": "2026-08-24 12:00:00.000000",
   "modified_by": "Administrator",
   "module": "Custom Batch Planning",
   "name": "Material Allocation",

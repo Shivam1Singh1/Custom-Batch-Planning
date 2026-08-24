@@ -1,0 +1,73 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-08-20 09:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "cutover_section",
+  "stock_cutover_datetime",
+  "cutover_help",
+  "enforcement_section",
+  "exempt_stock_entry_purposes"
+ ],
+ "fields": [
+  {
+   "fieldname": "cutover_section",
+   "fieldtype": "Section Break",
+   "label": "Stock Cutover"
+  },
+  {
+   "description": "Go-live marker for batch-tagged stock. Stock Ledger Entries posted on or after this moment are the only ones that count towards Global Main Wh and Global Free Qty. Leave blank until go-live: while it is blank, Global Main Wh and Free Qty report as pending rather than as a number, because an unscoped figure would be read as real stock.",
+   "fieldname": "stock_cutover_datetime",
+   "fieldtype": "Datetime",
+   "label": "Stock Cutover Datetime"
+  },
+  {
+   "fieldname": "cutover_help",
+   "fieldtype": "HTML",
+   "label": "Cutover Help",
+   "options": "<div class=\"text-muted small\"><p><b>Set this once, at go-live.</b> Everything posted before it is legacy stock: still queryable for audit, never counted in planning.</p><p>Changing it after go-live silently re-scopes every Free Qty figure in the system. Only adjust it if go-live itself moved.</p></div>"
+  },
+  {
+   "fieldname": "enforcement_section",
+   "fieldtype": "Section Break",
+   "label": "Tagging Enforcement"
+  },
+  {
+   "default": "Material Consumption\nRepack\nMaterial Issue\nInternal Transfer\nManufacture\nMaterial Transfer for Manufacture",
+   "description": "Stock Entry purposes exempt from mandatory Employee Function + Project after the cutover, one per line. These are general warehouse operations that are not part of any project. Anything NOT listed here must carry both fields to save. Material Transfer is deliberately absent: it is the purpose the batch-planning flow actually uses, so it must be tagged or Free Qty cannot be computed.",
+   "fieldname": "exempt_stock_entry_purposes",
+   "fieldtype": "Small Text",
+   "label": "Exempt Stock Entry Purposes"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-08-20 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Custom Batch Planning",
+ "name": "Batch Planning Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 100,
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

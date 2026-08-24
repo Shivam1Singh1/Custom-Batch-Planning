@@ -5,7 +5,6 @@ def execute():
         opt = frappe.get_meta("Stock Ledger Entry").get_field("batch_planning_id").options
         print(f"Option is now: {opt}")
         
-        # Check if it is an Inventory Dimension
         try:
             dims = frappe.get_all("Inventory Dimension", fields=["name", "document_type"])
             print(f"Inventory Dimensions: {dims}")

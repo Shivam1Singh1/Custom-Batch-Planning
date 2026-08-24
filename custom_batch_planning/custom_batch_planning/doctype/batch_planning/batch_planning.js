@@ -62,15 +62,6 @@ frappe.ui.form.on('Batch Planning', {
             }, 'Action');
         }
 
-        if (!frm.is_new()) {
-            frm.add_custom_button(__('View Batches Planned'), function () {
-                frappe.route_options = {
-                    "batch_planning": frm.doc.name
-                };
-                frappe.set_route('List', 'Batches Planned');
-            });
-        }
-
         setup_eye_buttons(frm);
 
         if (frm.doc.docstatus === 1 || frm.doc.workflow_state === 'Approved') {
@@ -91,7 +82,6 @@ frappe.ui.form.on('Batch Planning', {
             render_stock_entry_tab(frm);
             render_item_issue_tab(frm);
 
-            // Check if the planning window has fully passed
             let planning_passed = false;
             if (frm.doc.slot_opening_table && frm.doc.slot_opening_table.length > 0) {
                 let latest_date = null;
@@ -128,7 +118,9 @@ frappe.ui.form.on('Batch Planning', {
                         freeze: true,
                         freeze_message: __("Preparing Material Allocation..."),
                         callback: function (r) {
-                            if (r.message) {
+                            if (!r.message) return;
+
+                            let build_allocation = function () {
                                 if (r.message.warning) {
                                     frappe.msgprint({
                                         title: __("Material Allocation Note"),
@@ -139,7 +131,6 @@ frappe.ui.form.on('Batch Planning', {
                                 frappe.model.with_doctype("Material Allocation", function() {
                                         let new_doc = frappe.model.get_new_doc("Material Allocation");
                                         new_doc.batch_planning = r.message.batch_planning;
-                                        new_doc.batches_planned = r.message.batches_planned;
                                         new_doc.employee_function = r.message.employee_function;
                                         new_doc.project_id = r.message.project_id;
                                         new_doc.project_name = r.message.project_name;
@@ -154,12 +145,65 @@ frappe.ui.form.on('Batch Planning', {
                                                 child.quantity_required = row.quantity_required;
                                                 child.allocate_qty = row.allocate_qty;
                                                 child.stock_available = row.stock_available;
+                                                child.local_free_qty = row.local_free_qty;
+                                                child.global_free_qty = row.global_free_qty;
+                                                child.local_allocated_qty = row.local_allocated_qty;
+                                                child.global_allocated_qty = row.global_allocated_qty;
                                             });
                                         }
 
                                         frappe.set_route("Form", "Material Allocation", new_doc.name);
                                     });
+                            };
+
+                            let shared_rows = r.message.shared_stock_rows || [];
+                            if (!shared_rows.length) {
+                                build_allocation();
+                                return;
                             }
+
+                            let item_rows = shared_rows.map(function (d) {
+                                return `
+                                    <tr>
+                                        <td style="padding:5px 8px; font-weight:600;">${d.item_code}</td>
+                                        <td style="padding:5px 8px; text-align:right;">${d.required}</td>
+                                        <td style="padding:5px 8px; text-align:right;">${d.own_free}</td>
+                                        <td style="padding:5px 8px; text-align:right;">${d.global_free === null ? "-" : d.global_free}</td>
+                                        <td style="padding:5px 8px; text-align:right; font-weight:700; color:#b45309;">${d.shared_qty}</td>
+                                    </tr>`;
+                            }).join("");
+
+                            let d = new frappe.ui.Dialog({
+                                title: __("⚠️ Shared Free Stock"),
+                                size: "small",
+                                primary_action_label: __("Continue"),
+                                primary_action: function () {
+                                    d.hide();
+                                    build_allocation();
+                                },
+                                secondary_action_label: __("Cancel"),
+                                secondary_action: function () { d.hide(); }
+                            });
+
+                            d.body.innerHTML = `
+                                <p style="font-size:13px; margin-bottom:10px;">
+                                    <b>${r.message.shared_stock_required}</b> unit(s) will be taken from
+                                    other batches' free stock and reserved for <b>${frm.doc.name}</b>.
+                                </p>
+                                <table class="table table-bordered" style="width:100%; font-size:12px; margin-bottom:0;">
+                                    <thead style="background:#f1f5f9;">
+                                        <tr>
+                                            <th style="padding:5px 8px;">Item</th>
+                                            <th style="padding:5px 8px; text-align:right;">Req</th>
+                                            <th style="padding:5px 8px; text-align:right;">This Batch</th>
+                                            <th style="padding:5px 8px; text-align:right;">Global</th>
+                                            <th style="padding:5px 8px; text-align:right;">Shared</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>${item_rows}</tbody>
+                                </table>
+                            `;
+                            d.show();
                         }
                     });
                 }, __("Create"));
@@ -394,26 +438,24 @@ frappe.ui.form.on('Batch Planning', {
                     frm.refresh_field('slot_opening_table');
 
                     frappe.call({
-                        method: 'custom_batch_planning.custom_batch_planning.doctype.slot_opening.slot_opening.get_sct_details',
-                        args: { slot_master: r.message.slot_master },
+                        method: 'custom_batch_planning.custom_batch_planning.doctype.slot_opening.slot_opening.get_slot_opening_usage',
+                        args: { slot_opening: frm.doc.slot_opening },
                         callback: function (sct_r) {
-                            console.log("sct_r.message", sct_r.message);
-
                             if (!frm.fields_dict['custom_batch_details'] || !frm.fields_dict['custom_batch_details'].grid) {
                                 return;
                             }
 
-                            let sct_map = {};
+                            let remaining_map = {};
                             (sct_r.message || []).forEach(function (d) {
-                                sct_map[d.date] = parseInt(d.batches_planned) || 0;
+                                remaining_map[String(d.date)] = parseInt(d.remaining) || 0;
                             });
 
+                            let added = 0;
                             future_rows.forEach(function (slot) {
-                                let booked = parseInt(slot.planning_capacity) || 0;
-                                let planned = sct_map[slot.slot_booking_date] || 0;
-                                let remaining = booked - planned;
-
-                                if (remaining <= 0) return;
+                                let key = String(slot.slot_booking_date);
+                                let remaining = key in remaining_map
+                                    ? remaining_map[key]
+                                    : (parseInt(slot.planning_capacity) || 0);
 
                                 for (let i = 0; i < remaining; i++) {
                                     let child = frm.add_child('custom_batch_details');
@@ -421,13 +463,27 @@ frappe.ui.form.on('Batch Planning', {
                                     child.slot_booking_date = slot.slot_booking_date;
                                     child.reason = slot.reason;
                                     child.status = "Approved";
+                                    added++;
                                 }
                             });
 
                             frm.refresh_field('custom_batch_details');
 
+                            if (!added) {
+                                frappe.msgprint({
+                                    title: __('No Slots Left On This Opening'),
+                                    message: __(
+                                        'Slot Opening <b>' + frm.doc.slot_opening + '</b> has no unused ' +
+                                        'slots — every slot it booked already has a batch planned against it. ' +
+                                        'Book more capacity on the Slot Opening to plan another batch.'
+                                    ),
+                                    indicator: 'orange'
+                                });
+                                return;
+                            }
+
                             frappe.show_alert({
-                                message: `✅ Slots successfully loaded!`,
+                                message: `✅ Slots successfully loaded! ${added} batch row(s) added.`,
                                 indicator: 'green'
                             }, 4);
                         }
@@ -1396,6 +1452,7 @@ function render_material_planning_tab(frm) {
 
             let warehouse = r.message.warehouse;
             let data = r.message.results || [];
+            let free_qty_pending = !!r.message.free_qty_pending;
             frm._mp_data = data;
 
             if (!data.length) {
@@ -1414,68 +1471,73 @@ function render_material_planning_tab(frm) {
                 return num % 1 === 0 ? num.toString() : num.toFixed(2);
             };
 
+            let pipeline_line = function (qty, count, docs, doctype, color, label) {
+                let title = label ? ` title="${label}"` : "";
+                let n = parseFloat(qty || 0);
+                let c = parseInt(count || 0);
+                if (!(n > 0)) {
+                    return `<div style="color:#d1d5db; line-height:1.6;"${title}>0 (0)</div>`;
+                }
+                let docs_json = JSON.stringify(docs || []).replace(/"/g, '&quot;');
+                return `<div style="line-height:1.6;"${title}><span style="color:${color}; cursor:pointer; border-bottom:1px dotted ${color};"
+                    onclick="event.stopPropagation(); frappe.set_route('List', '${doctype}', {'name': ['in', ${docs_json}]})"
+                    >${format_qty_val(n)} (${c})</span></div>`;
+            };
+
+            let pipeline_cell = function (row, stage, doctype, labels) {
+                labels = labels || {};
+                return `
+                    <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+                        ${pipeline_line(row["gen_" + stage + "_qty"], row["gen_" + stage + "_count"], row["gen_" + stage + "_docs"], doctype, "#16a34a", labels.gen)}
+                        ${pipeline_line(row["bp_" + stage + "_qty"], row["bp_" + stage + "_count"], row["bp_" + stage + "_docs"], doctype, "#1d4ed8", labels.bp)}
+                    </td>
+                `;
+            };
+
+            let GRN_SECTIONS = {
+                gen: "Global Unapproved GRN — receipts tagged to OTHER Batch Plannings, waiting on Store Head approval.",
+                bp: "Local Unapproved GRN — receipts tagged to THIS Batch Planning, waiting on Store Head approval.",
+            };
+
+            let stock_line = function (qty, color, pending_title) {
+                if (qty === null || qty === undefined) {
+                    return `<div style="color:#9ca3af; font-style:italic; line-height:1.6;" title="${pending_title || ""}">pending</div>`;
+                }
+                let n = parseFloat(qty || 0);
+                if (n <= 0) {
+                    return `<div style="color:#d1d5db; line-height:1.6;">0</div>`;
+                }
+                return `<div style="color:${color}; line-height:1.6;">${format_qty_val(n)}</div>`;
+            };
+
+            let PENDING_HINT = "Pending until the stock cutover go-live marker is set in Batch Planning Settings.";
+
+            let stock_cell = function (global_qty, bp_qty) {
+                return `
+                    <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+                        ${stock_line(global_qty, "#16a34a", PENDING_HINT)}
+                        ${stock_line(bp_qty, "#1d4ed8")}
+                    </td>
+                `;
+            };
+
+
+            let free_line = function (qty, color) {
+                if (qty === null || qty === undefined) {
+                    return `<div style="color:#9ca3af; font-style:italic; line-height:1.6;" title="${PENDING_HINT}">pending</div>`;
+                }
+                let n = parseFloat(qty || 0);
+                let shown = n < 0 ? 0 : n;
+                let title = n < 0 ? `Actual: ${format_qty_val(n)} — more is reserved than this scope's stock covers.` : "";
+                return `<div style="color:${shown > 0 ? color : "#dc2626"}; line-height:1.6;" title="${title}">${format_qty_val(shown)}</div>`;
+            };
+
             let rows_html = data.map((row, i) => {
                 let bg = i % 2 === 0 ? "#f9fafb" : "#ffffff";
 
-                let mr_qty = parseFloat(row.bp_mr_qty || 0);
-                let mr_count = parseInt(row.bp_mr_count || 0);
-                let mr_docs = row.bp_mr_docs || [];
-                let mr_td = "";
-                if (mr_qty > 0) {
-                    let docs_json = JSON.stringify(mr_docs).replace(/"/g, '&quot;');
-                    mr_td = `
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; cursor:pointer; color:#1f2937;"
-                            onclick="frappe.set_route('List', 'Material Request', {'name': ['in', ${docs_json}]})">
-                            <span style="color:#16a34a;">${format_qty_val(mr_qty)} (${mr_count})</span>
-                        </td>
-                    `;
-                } else {
-                    mr_td = `
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#9ca3af;">
-                            <span style="color:#d1d5db;">0 (0)</span>
-                        </td>
-                    `;
-                }
-
-                let po_qty = parseFloat(row.bp_po_qty || 0);
-                let po_count = parseInt(row.bp_po_count || 0);
-                let po_docs = row.bp_po_docs || [];
-                let po_td = "";
-                if (po_qty > 0) {
-                    let docs_json = JSON.stringify(po_docs).replace(/"/g, '&quot;');
-                    po_td = `
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; cursor:pointer; color:#1f2937;"
-                            onclick="frappe.set_route('List', 'Purchase Order', {'name': ['in', ${docs_json}]})">
-                            <span style="color:#16a34a;">${format_qty_val(po_qty)} (${po_count})</span>
-                        </td>
-                    `;
-                } else {
-                    po_td = `
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#9ca3af;">
-                            <span style="color:#d1d5db;">0 (0)</span>
-                        </td>
-                    `;
-                }
-
-                let pr_qty = parseFloat(row.bp_pr_qty || 0);
-                let pr_count = parseInt(row.bp_pr_count || 0);
-                let pr_docs = row.bp_pr_docs || [];
-                let pr_td = "";
-                if (pr_qty > 0) {
-                    let docs_json = JSON.stringify(pr_docs).replace(/"/g, '&quot;');
-                    pr_td = `
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; cursor:pointer; color:#1f2937;"
-                            onclick="frappe.set_route('List', 'Purchase Receipt', {'name': ['in', ${docs_json}]})">
-                            <span style="color:#16a34a;">${format_qty_val(pr_qty)} (${pr_count})</span>
-                        </td>
-                    `;
-                } else {
-                    pr_td = `
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#9ca3af;">
-                            <span style="color:#d1d5db;">0 (0)</span>
-                        </td>
-                    `;
-                }
+                let mr_td = pipeline_cell(row, "mr", "Material Request");
+                let po_td = pipeline_cell(row, "po", "Purchase Order");
+                let pr_td = pipeline_cell(row, "pr", "Purchase Receipt", GRN_SECTIONS);
 
                 return `
                     <tr style="background:${bg}; border-bottom: 1px solid #e5e7eb;">
@@ -1484,10 +1546,16 @@ function render_material_planning_tab(frm) {
                         <td style="padding:9px 10px; color:#1f2937; font-size:12px; font-weight:500;">${row.item_name || ""}</td>
                         <td style="padding:9px 10px; text-align:center; color:#4b5563; font-size:12px; font-family:monospace;">${row.uom || ""}</td>
                         <td style="padding:9px 10px; text-align:center; font-weight:700; color:#d97706; font-size:12px;">${format_qty_val(row.qty_required)}</td>
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#15803d; font-size:12px;">${format_qty_val(row.total_stock)}</td>
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#1d4ed8; font-size:12px;">${format_qty_val(row.main_stock)}</td>
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#d97706; font-size:12px;">${format_qty_val(row.allocated_qty)}</td>
-                        <td style="padding:9px 10px; text-align:center; font-weight:700; font-size:12px; color:${parseFloat(row.free_stock || 0) > 0 ? "#15803d" : "#dc2626"};">${format_qty_val(row.free_stock)}</td>
+                        ${stock_cell(row.gen_total_stock, row.bp_total_stock)}
+                        ${stock_cell(row.gen_main_stock, row.bp_main_stock)}
+                        <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+                            <div style="line-height:1.6; color:#e5e7eb;">·</div>
+                            ${stock_line(row.allocated_qty, "#1d4ed8")}
+                        </td>
+                        <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+                            ${free_line(row.global_free_stock, "#15803d")}
+                            ${free_line(row.bp_free_stock, "#1d4ed8")}
+                        </td>
                         <td style="padding:9px 10px; text-align:center; font-weight:700; color:#7c3aed; font-size:12px;">${format_qty_val(row.lab_stock)}</td>
                         ${mr_td}
                         ${po_td}
@@ -1504,6 +1572,20 @@ function render_material_planning_tab(frm) {
                         <div>
                             <div style="font-size:15px; font-weight:700;">🏭 Consolidated Material Planning — Stock vs Requirement</div>
                             <div style="font-size:12px; opacity:0.85; margin-top:2px;">Warehouse: <b>${warehouse}</b></div>
+                            <!-- Which line is which in the stacked cells. Dots are
+                                 the light tints of the table's green and blue —
+                                 the true #16a34a / #1d4ed8 disappear against this
+                                 dark header. -->
+                            <div style="font-size:11px; margin-top:5px; display:inline-flex; align-items:center;
+                                        gap:9px; background:rgba(255,255,255,0.15); padding:3px 10px; border-radius:20px;">
+                                <span style="display:inline-flex; align-items:center; gap:5px;">
+                                    <span style="width:8px; height:8px; border-radius:50%; background:#86efac; display:inline-block;"></span>Top = Global
+                                </span>
+                                <span style="opacity:0.45;">|</span>
+                                <span style="display:inline-flex; align-items:center; gap:5px;">
+                                    <span style="width:8px; height:8px; border-radius:50%; background:#93c5fd; display:inline-block;"></span>Bottom = This Batch
+                                </span>
+                            </div>
                         </div>
                         <div style="background:rgba(255,255,255,0.15); padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600;">
                             ${data.length} Items
@@ -1518,15 +1600,15 @@ function render_material_planning_tab(frm) {
                                     <th style="${th_style("left")}">Item Name</th>
                                     <th style="${th_style()}">UOM</th>
                                     <th style="${th_style()}">Qty Req</th>
-                                    <th style="${th_style()}">Total Stock</th>
-                                    <th style="${th_style()}">Main Wh</th>
-                                    <th style="${th_style()}">Allocated</th>
-                                    <th style="${th_style()}">Free Qty</th>
-                                    <th style="${th_style()}">Lab Wise</th>
-                                    <th style="${th_style()}">Open MR</th>
-                                    <th style="${th_style()}">Open PO</th>
-                                    <th style="${th_style()}">Open PR/GRN</th>
-                                    <th style="${th_style()}">Net Req</th>
+                                    <th style="${th_style()}" title="Top (green) = OTHER BATCHES: stock tagged to a different Batch Planning, same Project and store. Bottom (blue) = THIS BATCH: its Main Wh stock plus its own Lab Wise. Untagged stock is in neither line. Other Batches carries no Lab figure — material drawn into a batch's Lab is committed to that batch's process.">Total Stock</th>
+                                    <th style="${th_style()}" title="Physical stock in this Employee Function's main store, tagged by the batch that bought it. Top (green) = OTHER Batch Plannings, bottom (blue) = THIS batch. Untagged stock counts in neither line, so it cannot be allocated. Reserved qty is not shown here — what is left unreserved appears under Free Qty.">Main Wh</th>
+                                    <th style="${th_style()}" title="Qty reserved by THIS Batch Planning through Material Allocation. Other batches' reservations are not shown in this table; their effect is already subtracted from the green line under Free Qty. Deallocated, Stock Entry Done and cancelled allocations are excluded: they no longer hold stock.">Allocated</th>
+                                    <th style="${th_style()}" title="Unreserved tagged stock. Top (green) = OTHER batches' Main Wh minus their Allocated — material they bought but have not reserved, which this batch may borrow after confirming. Bottom (blue) = THIS batch's Main Wh minus its own Allocated. The two sets are disjoint, so an allocation may draw on their SUM: this batch's own free stock is spent first, and only the remainder needs confirmation.">Free Qty</th>
+                                    <th style="${th_style()}" title="Qty shifted from Main Wh to Lab for this batch only. No GEN or global equivalent — another batch's Lab stock is not part of the shared pool.">Lab Wise</th>
+                                    <th style="${th_style()}" title="Approved Purchase-type MR qty not yet covered by an approved Purchase Order. Draft and pending-approval MRs are excluded entirely, and a draft or pending PO does not retire the qty — only an approved PO does. Material Transfer / Issue / Manufacture requests are excluded: they are not procurement. Top = GEN (other batches), bottom = BP (this batch). Separate pools — never add them.">Open MR</th>
+                                    <th style="${th_style()}" title="Approved PO qty not yet covered by a Store-Head-approved GRN. Draft and pending-approval POs are excluded entirely, and a draft or pending GRN does not retire the qty — only an approved one does. Top = GEN (other batches), bottom = BP (this batch). Separate pools — never add them.">Open PO</th>
+                                    <th style="${th_style()}" title="Goods physically received but NOT yet approved by Store Head, so not usable stock. Two sections: top (green) = Global Unapproved GRN, receipts tagged to OTHER Batch Plannings; bottom (blue) = Local Unapproved GRN, receipts tagged to THIS batch. Receipts tagged to no batch appear in neither, exactly as for Open MR and Open PO. Separate pools — never add them. On Store Head approval a receipt leaves this column immediately and its qty shows up as real stock instead. Visibility only: no calculation subtracts this column, because Open PO already carries the same units until the receipt is approved.">Unapproved GRN</th>
+                                    <th style="${th_style()}" title="Qty Req − Main Wh − Lab Wise − Open MR − Open PO, using this batch's (BP) figures only. Unapproved GRN is NOT subtracted: Open PO already carries those units until the receipt is approved, and subtracting both would credit the same goods twice. GEN is never used for coverage: it is other batches' open demand, material they have already committed to.">Net Req</th>
                                     <th style="${th_style()}">Usable</th>
                                     <th style="${th_style()}">Expired Qty</th>
                                 </tr>

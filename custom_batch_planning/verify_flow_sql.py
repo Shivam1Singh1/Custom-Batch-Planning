@@ -1,13 +1,11 @@
 import frappe
 
 def execute():
-    # Setup test variables
     bp_name = "TEST-BP-003"
     project = "PLTP-2025-0001"
     item_code = "CN02010007"
     warehouse = "Stores - MS"
     
-    # 1. Clear any old test data
     frappe.db.sql("DELETE FROM `tabMaterial Request` WHERE custom_batch_planning_no = %s", bp_name)
     frappe.db.sql("DELETE FROM `tabMaterial Request Item` WHERE batch_planning_id = %s", bp_name)
     frappe.db.sql("DELETE FROM `tabPurchase Order` WHERE project = %s AND name LIKE 'TEST-PO%%'", project)
@@ -20,7 +18,6 @@ def execute():
     print("\n" + "="*50)
     print("STEP 1: Create & Submit MR for qty = 50")
     print("="*50)
-    # Simulate Frappe standard creation of submitted MR
     frappe.db.sql("""
         INSERT INTO `tabMaterial Request` (name, docstatus, project, custom_batch_planning_no, status, material_request_type, creation, modified)
         VALUES ('TEST-MR-1', 1, %s, %s, 'Pending', 'Purchase', NOW(), NOW())
@@ -38,7 +35,6 @@ def execute():
     print("\n" + "="*50)
     print("STEP 2: Create & Submit PO for qty = 30 (Converted from MR)")
     print("="*50)
-    # Simulate Frappe standard creation of PO and update of MR's ordered_qty
     frappe.db.sql("""
         INSERT INTO `tabPurchase Order` (name, docstatus, project, status, creation, modified)
         VALUES ('TEST-PO-1', 1, %s, 'Pending', NOW(), NOW())
@@ -49,7 +45,6 @@ def execute():
         VALUES ('TEST-PO-ITM-1', 'TEST-PO-1', %s, 30.0, 0.0, %s, 'TEST-MR-1', 'TEST-MR-ITM-1', NOW(), NOW())
     """, (item_code, bp_name))
     
-    # Standard Frappe behavior: ordered_qty increases by 30
     frappe.db.sql("UPDATE `tabMaterial Request Item` SET ordered_qty = 30.0 WHERE name = 'TEST-MR-ITM-1'")
     frappe.db.commit()
     print("Created PO: TEST-PO-1")
@@ -59,7 +54,6 @@ def execute():
     print("\n" + "="*50)
     print("STEP 3: Create & Submit GRN (PR) for qty = 10 (Approved)")
     print("="*50)
-    # Simulate Frappe standard creation of PR, update of PO's received_qty, and SLE creation
     frappe.db.sql("""
         INSERT INTO `tabPurchase Receipt` (name, docstatus, project, status, creation, modified)
         VALUES ('TEST-PR-1', 1, %s, 'Pending', NOW(), NOW())
@@ -70,10 +64,8 @@ def execute():
         VALUES ('TEST-PR-ITM-1', 'TEST-PR-1', %s, 10.0, %s, 'TEST-PO-1', 'TEST-PO-ITM-1', NOW(), NOW())
     """, (item_code, bp_name))
     
-    # Standard Frappe behavior: received_qty increases by 10
     frappe.db.sql("UPDATE `tabPurchase Order Item` SET received_qty = 10.0 WHERE name = 'TEST-PO-ITM-1'")
     
-    # Standard Frappe behavior: SLE is created for docstatus=1 PR
     frappe.db.sql("""
         INSERT INTO `tabStock Ledger Entry` (name, item_code, warehouse, actual_qty, batch_planning_id, project, is_cancelled, creation, modified, voucher_type, voucher_no)
         VALUES ('TEST-SLE-1', %s, %s, 10.0, %s, %s, 0, NOW(), NOW(), 'Purchase Receipt', 'TEST-PR-1')
@@ -83,7 +75,6 @@ def execute():
     check_status(item_code, bp_name, project, warehouse)
 
 def check_status(item_code, bp_name, project, warehouse):
-    # This runs the EXACT SAME queries used in get_material_planning_data
     main_stock = frappe.db.sql("""
         SELECT IFNULL(SUM(actual_qty), 0)
         FROM `tabStock Ledger Entry`

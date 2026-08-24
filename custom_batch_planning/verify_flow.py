@@ -4,21 +4,16 @@ from frappe.utils import today
 def execute():
     print("--- STARTING MR->PO->GRN CHAIN TEST ---")
 
-    # We will use BP-26-07-001 and an arbitrary item. 
-    # Let's find an item that exists in BP-26-07-001.
     bp_doc = frappe.get_doc("Batch Planning", "BP-26-07-001")
     from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import get_material_planning_data
     
     test_item = "CN02010007"
     print(f"Using Item Code: {test_item}")
     
-    # We will override the qty_required in our test to 100, just for checking math manually,
-    # or we can just print the exact variables we need.
     
     bp_name = "TEST-BP-001"
     project = bp_doc.project
     
-    # Create MR (qty = 50)
     mr = frappe.new_doc("Material Request")
     mr.material_request_type = "Purchase"
     mr.custom_batch_planning_no = bp_name
@@ -39,7 +34,6 @@ def execute():
     
     check_status("Step 1", test_item, bp_name, project)
     
-    # Create PO from MR (qty = 30)
     po = frappe.new_doc("Purchase Order")
     po.supplier = frappe.db.get_value("Supplier", {"disabled": 0}, "name")
     po.project = project
@@ -63,7 +57,6 @@ def execute():
     
     check_status("Step 2", test_item, bp_name, project)
     
-    # Create PR (GRN) from PO (qty = 10, docstatus = 1)
     pr = frappe.new_doc("Purchase Receipt")
     pr.supplier = po.supplier
     pr.project = project
@@ -77,12 +70,11 @@ def execute():
         "purchase_order_item": po.items[0].name,
         "batch_planning_id": bp_name,
         "rate": 100,
-        "warehouse": "Stores - MS", # Need a valid warehouse
+        "warehouse": "Stores - MS",
         "uom": "Nos",
         "conversion_factor": 1
     })
     
-    # Fetch a valid warehouse
     pr.items[0].warehouse = frappe.db.get_value("Warehouse", {"is_group": 0}, "name")
     
     pr.flags.ignore_mandatory = True

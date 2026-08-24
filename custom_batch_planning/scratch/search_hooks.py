@@ -12,7 +12,7 @@ def main():
                 found = True
             if found:
                 print(f"{idx}: {line.strip()}")
-                if "]" in line and idx > lines.index(line): # rough stop condition
+                if "]" in line and idx > lines.index(line):
                     break
     else:
         print("hooks.py not found")
