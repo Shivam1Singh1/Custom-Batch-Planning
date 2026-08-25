@@ -54,23 +54,23 @@
    "read_only": 1
   },
   {
-   "description": "Unreserved stock tagged to THIS Batch Planning. Consumed first.",
+   "description": "Unreserved stock tagged to the CURRENT BATCH. Consumed first.",
    "fieldname": "local_free_qty",
    "fieldtype": "Float",
    "in_list_view": 1,
-   "label": "This Batch Free",
+   "label": "Current Batch Free",
    "read_only": 1
   },
   {
-   "description": "Unreserved stock tagged to OTHER Batch Plannings. Used only after this batch's own free stock runs out, and only after confirmation.",
+   "description": "Unreserved stock tagged to the GLOBAL BATCH (other Batch Plannings). Used only after the Current Batch's own free stock runs out, and only after confirmation.",
    "fieldname": "global_free_qty",
    "fieldtype": "Float",
    "in_list_view": 1,
-   "label": "Global Free",
+   "label": "Global Batch Free",
    "read_only": 1
   },
   {
-   "description": "This Batch Free + Global Free \u2014 the ceiling for Qty Requested.",
+   "description": "Current Batch Free + Global Batch Free \u2014 the ceiling for Qty Requested.",
    "fieldname": "stock_available",
    "fieldtype": "Float",
    "in_list_view": 1,
@@ -103,18 +103,18 @@
   },
   {
    "allow_on_submit": 1,
-   "description": "Portion of Qty Requested taken from this batch's own free stock.",
+   "description": "Portion of Qty Requested taken from the Current Batch's own free stock.",
    "fieldname": "local_allocated_qty",
    "fieldtype": "Float",
-   "label": "From This Batch",
+   "label": "From Current Batch",
    "read_only": 1
   },
   {
    "allow_on_submit": 1,
-   "description": "Portion of Qty Requested taken from other batches' free stock. Deallocation returns this to the shared pool.",
+   "description": "Portion of Qty Requested taken from Global Batch free stock. Deallocation returns this to the shared pool.",
    "fieldname": "global_allocated_qty",
    "fieldtype": "Float",
-   "label": "From Global",
+   "label": "From Global Batch",
    "read_only": 1
   },
   {

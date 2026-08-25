@@ -1,3 +1,205 @@
+// Body markup for the "⚠️ Shared Free Stock" confirmation, rendered into the
+// dialog's HTML field. An identical copy lives in batch_planning.js — keep the
+// two in step; each form only loads its own doctype's script, so neither can
+// borrow the other's definition. Fixed column widths stop a long item code from
+// squeezing the four numeric columns into each other, and the header and total
+// rows stay pinned while the item list scrolls.
+window.render_shared_stock_table = function (opts) {
+    let esc = function (v) {
+        return frappe.utils.escape_html(v === null || v === undefined ? "" : String(v));
+    };
+    let fmt = function (v) {
+        return (Math.round(flt(v) * 100) / 100).toLocaleString(undefined, {
+            maximumFractionDigits: 2
+        });
+    };
+    let blank = function (v) { return v === null || v === undefined; };
+
+    let rows = opts.rows || [];
+    let required_total = rows.reduce(function (sum, r) { return sum + flt(r.required); }, 0);
+    let shared_total = blank(opts.total)
+        ? rows.reduce(function (sum, r) { return sum + flt(r.shared_qty); }, 0)
+        : flt(opts.total);
+
+    let item_rows = rows.map(function (r) {
+        let caption = [r.item_name, r.uom].filter(Boolean).map(esc).join(" &middot; ");
+        return `
+            <tr>
+                <td class="ssd-item">
+                    <span class="ssd-code">${esc(r.item_code)}</span>
+                    ${caption ? `<span class="ssd-caption">${caption}</span>` : ""}
+                </td>
+                <td data-label="${__("Required")}">${fmt(r.required)}</td>
+                <td data-label="${__("Current Batch free")}">${fmt(r.own_free)}</td>
+                <td data-label="${__("Global Batch free")}">${blank(r.global_free) ? '<span class="ssd-muted">&mdash;</span>' : fmt(r.global_free)}</td>
+                <td class="ssd-shared" data-label="${__("Shared")}">${fmt(r.shared_qty)}</td>
+            </tr>`;
+    }).join("");
+
+    return `
+        <style>
+        .ssd { font-size: 13px; color: var(--text-color); }
+        .ssd-lead {
+            background: var(--bg-orange);
+            color: var(--text-on-orange);
+            border-radius: var(--border-radius-md, 6px);
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            line-height: 1.55;
+        }
+        .ssd-scroll {
+            max-height: 46vh;
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius-md, 6px);
+        }
+        .ssd-table {
+            width: 100%;
+            /* Below this the four numeric columns start clipping, so the
+               wrapper scrolls sideways instead of the dialog cutting them off. */
+            min-width: 460px;
+            table-layout: fixed;
+            border-collapse: separate;
+            border-spacing: 0;
+            margin: 0;
+            font-variant-numeric: tabular-nums;
+        }
+        .ssd-table th,
+        .ssd-table td {
+            padding: 8px 12px;
+            text-align: right;
+            vertical-align: middle;
+            white-space: nowrap;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .ssd-table th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: var(--subtle-accent);
+            /* "Current Batch" / "Global Batch" are too long to hold one line in
+               a 15% column — let them wrap rather than push the column wider. */
+            white-space: normal;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.3;
+            letter-spacing: .3px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+        .ssd-table th.ssd-item,
+        .ssd-table td.ssd-item { text-align: left; }
+        .ssd-table td.ssd-item { white-space: normal; word-break: break-word; }
+        .ssd-unit {
+            display: block;
+            font-size: 10px;
+            font-weight: 400;
+            letter-spacing: 0;
+            text-transform: none;
+        }
+        .ssd-code { display: block; font-weight: 600; }
+        .ssd-caption { display: block; font-size: 11px; color: var(--text-muted); }
+        .ssd-shared { font-weight: 700; color: var(--text-on-orange); }
+        .ssd-muted { color: var(--text-muted); font-weight: 400; }
+        .ssd-table tbody tr:last-child td { border-bottom: none; }
+        .ssd-table tfoot td {
+            position: sticky;
+            bottom: 0;
+            background: var(--subtle-accent);
+            font-weight: 600;
+            border-top: 1px solid var(--border-color);
+            border-bottom: none;
+        }
+
+        /* Phone / narrow desk: a five-column grid can only shrink so far, so
+           each row becomes its own card with the column header inlined as a
+           label. Nothing scrolls sideways and nothing is cut off. */
+        @media (max-width: 575.98px) {
+            .ssd-scroll {
+                max-height: none;
+                overflow: visible;
+                border: none;
+            }
+            .ssd-table {
+                min-width: 0;
+                table-layout: auto;
+            }
+            .ssd-table colgroup,
+            .ssd-table thead { display: none; }
+            .ssd-table tbody tr,
+            .ssd-table tfoot tr {
+                display: block;
+                margin-bottom: 8px;
+                border: 1px solid var(--border-color);
+                border-radius: var(--border-radius-md, 6px);
+                overflow: hidden;
+            }
+            .ssd-table tfoot tr { margin-bottom: 0; }
+            .ssd-table td {
+                display: flex;
+                align-items: baseline;
+                justify-content: space-between;
+                gap: 16px;
+                white-space: normal;
+                border-bottom: 1px solid var(--border-color);
+            }
+            .ssd-table td::before {
+                content: attr(data-label);
+                flex: 0 0 auto;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: .3px;
+                text-transform: uppercase;
+                color: var(--text-muted);
+            }
+            .ssd-table td.ssd-item {
+                display: block;
+                background: var(--subtle-accent);
+            }
+            .ssd-table td.ssd-item::before { content: none; }
+            .ssd-table tfoot td { position: static; }
+            .ssd-table tr td:last-child { border-bottom: none; }
+        }
+        </style>
+        <div class="ssd">
+            <div class="ssd-lead">
+                <b>${fmt(shared_total)}</b> ${__("unit(s) will be taken from Global Batch free stock and reserved for")} <b>${esc(opts.target)}</b>.
+            </div>
+            <div class="ssd-scroll">
+                <table class="ssd-table">
+                    <colgroup>
+                        <col style="width:40%">
+                        <col style="width:15%">
+                        <col style="width:15%">
+                        <col style="width:15%">
+                        <col style="width:15%">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th class="ssd-item">${__("Item")}</th>
+                            <th>${__("Required")}</th>
+                            <th>${__("Current Batch")}<span class="ssd-unit">${__("free")}</span></th>
+                            <th>${__("Global Batch")}<span class="ssd-unit">${__("free")}</span></th>
+                            <th>${__("Shared")}<span class="ssd-unit">${__("taken now")}</span></th>
+                        </tr>
+                    </thead>
+                    <tbody>${item_rows}</tbody>
+                    <tfoot>
+                        <tr>
+                            <td class="ssd-item">${__("Total")}</td>
+                            <td data-label="${__("Required")}">${fmt(required_total)}</td>
+                            <td class="ssd-muted" data-label="${__("Current Batch free")}">&mdash;</td>
+                            <td class="ssd-muted" data-label="${__("Global Batch free")}">&mdash;</td>
+                            <td class="ssd-shared" data-label="${__("Shared")}">${fmt(shared_total)}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+    `;
+};
+
 frappe.ui.form.on("Material Allocation", {
     setup: function (frm) {
         frm.set_query("batch_planning", function () {
@@ -443,42 +645,37 @@ window.auto_allocate_all = function (frm) {
         (a, r) => a + parseFloat(r.global_allocated_qty || 0), 0
     );
 
-    let rows = shared.map((r) => `
-        <tr>
-            <td style="padding:5px 8px; font-weight:600;">${r.item_code}</td>
-            <td style="padding:5px 8px; text-align:right;">${r.allocate_qty || 0}</td>
-            <td style="padding:5px 8px; text-align:right;">${r.local_free_qty || 0}</td>
-            <td style="padding:5px 8px; text-align:right;">${r.global_free_qty || 0}</td>
-            <td style="padding:5px 8px; text-align:right; font-weight:700; color:#b45309;">${r.global_allocated_qty || 0}</td>
-        </tr>`).join("");
+    // The allocation child rows carry their own field names; map them onto the
+    // shape render_shared_stock_table expects so both dialogs stay identical.
+    let rows = shared.map((r) => ({
+        item_code: r.item_code,
+        item_name: r.item_name,
+        uom: r.uom,
+        required: r.allocate_qty,
+        own_free: r.local_free_qty,
+        global_free: r.global_free_qty,
+        shared_qty: r.global_allocated_qty,
+    }));
 
     let d = new frappe.ui.Dialog({
         title: __("⚠️ Shared Free Stock"),
-        size: "small",
+        // Five columns need the room — at the default 600px the item name wraps
+        // to three lines while the numeric columns sit half empty.
+        size: "large",
+        fields: [{ fieldtype: "HTML", fieldname: "shared_stock" }],
         primary_action_label: __("Continue"),
         primary_action: function () { d.hide(); run_fefo(); },
         secondary_action_label: __("Cancel"),
         secondary_action: function () { d.hide(); }
     });
 
-    d.body.innerHTML = `
-        <p style="font-size:13px; margin-bottom:10px;">
-            <b>${shared_total}</b> unit(s) will be taken from other batches' free stock
-            and reserved for <b>${frm.doc.batch_planning}</b>.
-        </p>
-        <table class="table table-bordered" style="width:100%; font-size:12px; margin-bottom:0;">
-            <thead style="background:#f1f5f9;">
-                <tr>
-                    <th style="padding:5px 8px;">Item</th>
-                    <th style="padding:5px 8px; text-align:right;">Req</th>
-                    <th style="padding:5px 8px; text-align:right;">This Batch</th>
-                    <th style="padding:5px 8px; text-align:right;">Global</th>
-                    <th style="padding:5px 8px; text-align:right;">Shared</th>
-                </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-        </table>
-    `;
+    d.fields_dict.shared_stock.$wrapper.html(
+        window.render_shared_stock_table({
+            rows: rows,
+            total: shared_total,
+            target: frm.doc.batch_planning,
+        })
+    );
     d.show();
 };
 

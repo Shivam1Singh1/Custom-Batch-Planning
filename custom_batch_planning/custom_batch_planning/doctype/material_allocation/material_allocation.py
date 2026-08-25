@@ -125,7 +125,7 @@ class MaterialAllocation(Document):
                 frappe.throw(
                     f"<b>{item_code}</b>: need <b>{requested}</b>{rows_note}, "
                     f"only <b>{available}</b> free "
-                    f"(this batch {split['local_free']} + global {split['global_free']}).",
+                    f"(current batch {split['local_free']} + global batch {split['global_free']}).",
                     title="Insufficient Free Stock",
                 )
 

@@ -4,6 +4,208 @@ if (typeof XLSX === 'undefined') {
     document.head.appendChild(s);
 }
 
+// Body markup for the "⚠️ Shared Free Stock" confirmation, rendered into the
+// dialog's HTML field. An identical copy lives in material_allocation.js — keep
+// the two in step; each form only loads its own doctype's script, so neither can
+// borrow the other's definition. Fixed column widths stop a long item code from
+// squeezing the four numeric columns into each other, and the header and total
+// rows stay pinned while the item list scrolls.
+window.render_shared_stock_table = function (opts) {
+    let esc = function (v) {
+        return frappe.utils.escape_html(v === null || v === undefined ? "" : String(v));
+    };
+    let fmt = function (v) {
+        return (Math.round(flt(v) * 100) / 100).toLocaleString(undefined, {
+            maximumFractionDigits: 2
+        });
+    };
+    let blank = function (v) { return v === null || v === undefined; };
+
+    let rows = opts.rows || [];
+    let required_total = rows.reduce(function (sum, r) { return sum + flt(r.required); }, 0);
+    let shared_total = blank(opts.total)
+        ? rows.reduce(function (sum, r) { return sum + flt(r.shared_qty); }, 0)
+        : flt(opts.total);
+
+    let item_rows = rows.map(function (r) {
+        let caption = [r.item_name, r.uom].filter(Boolean).map(esc).join(" &middot; ");
+        return `
+            <tr>
+                <td class="ssd-item">
+                    <span class="ssd-code">${esc(r.item_code)}</span>
+                    ${caption ? `<span class="ssd-caption">${caption}</span>` : ""}
+                </td>
+                <td data-label="${__("Required")}">${fmt(r.required)}</td>
+                <td data-label="${__("Current Batch free")}">${fmt(r.own_free)}</td>
+                <td data-label="${__("Global Batch free")}">${blank(r.global_free) ? '<span class="ssd-muted">&mdash;</span>' : fmt(r.global_free)}</td>
+                <td class="ssd-shared" data-label="${__("Shared")}">${fmt(r.shared_qty)}</td>
+            </tr>`;
+    }).join("");
+
+    return `
+        <style>
+        .ssd { font-size: 13px; color: var(--text-color); }
+        .ssd-lead {
+            background: var(--bg-orange);
+            color: var(--text-on-orange);
+            border-radius: var(--border-radius-md, 6px);
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            line-height: 1.55;
+        }
+        .ssd-scroll {
+            max-height: 46vh;
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius-md, 6px);
+        }
+        .ssd-table {
+            width: 100%;
+            /* Below this the four numeric columns start clipping, so the
+               wrapper scrolls sideways instead of the dialog cutting them off. */
+            min-width: 460px;
+            table-layout: fixed;
+            border-collapse: separate;
+            border-spacing: 0;
+            margin: 0;
+            font-variant-numeric: tabular-nums;
+        }
+        .ssd-table th,
+        .ssd-table td {
+            padding: 8px 12px;
+            text-align: right;
+            vertical-align: middle;
+            white-space: nowrap;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .ssd-table th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: var(--subtle-accent);
+            /* "Current Batch" / "Global Batch" are too long to hold one line in
+               a 15% column — let them wrap rather than push the column wider. */
+            white-space: normal;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.3;
+            letter-spacing: .3px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+        .ssd-table th.ssd-item,
+        .ssd-table td.ssd-item { text-align: left; }
+        .ssd-table td.ssd-item { white-space: normal; word-break: break-word; }
+        .ssd-unit {
+            display: block;
+            font-size: 10px;
+            font-weight: 400;
+            letter-spacing: 0;
+            text-transform: none;
+        }
+        .ssd-code { display: block; font-weight: 600; }
+        .ssd-caption { display: block; font-size: 11px; color: var(--text-muted); }
+        .ssd-shared { font-weight: 700; color: var(--text-on-orange); }
+        .ssd-muted { color: var(--text-muted); font-weight: 400; }
+        .ssd-table tbody tr:last-child td { border-bottom: none; }
+        .ssd-table tfoot td {
+            position: sticky;
+            bottom: 0;
+            background: var(--subtle-accent);
+            font-weight: 600;
+            border-top: 1px solid var(--border-color);
+            border-bottom: none;
+        }
+
+        /* Phone / narrow desk: a five-column grid can only shrink so far, so
+           each row becomes its own card with the column header inlined as a
+           label. Nothing scrolls sideways and nothing is cut off. */
+        @media (max-width: 575.98px) {
+            .ssd-scroll {
+                max-height: none;
+                overflow: visible;
+                border: none;
+            }
+            .ssd-table {
+                min-width: 0;
+                table-layout: auto;
+            }
+            .ssd-table colgroup,
+            .ssd-table thead { display: none; }
+            .ssd-table tbody tr,
+            .ssd-table tfoot tr {
+                display: block;
+                margin-bottom: 8px;
+                border: 1px solid var(--border-color);
+                border-radius: var(--border-radius-md, 6px);
+                overflow: hidden;
+            }
+            .ssd-table tfoot tr { margin-bottom: 0; }
+            .ssd-table td {
+                display: flex;
+                align-items: baseline;
+                justify-content: space-between;
+                gap: 16px;
+                white-space: normal;
+                border-bottom: 1px solid var(--border-color);
+            }
+            .ssd-table td::before {
+                content: attr(data-label);
+                flex: 0 0 auto;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: .3px;
+                text-transform: uppercase;
+                color: var(--text-muted);
+            }
+            .ssd-table td.ssd-item {
+                display: block;
+                background: var(--subtle-accent);
+            }
+            .ssd-table td.ssd-item::before { content: none; }
+            .ssd-table tfoot td { position: static; }
+            .ssd-table tr td:last-child { border-bottom: none; }
+        }
+        </style>
+        <div class="ssd">
+            <div class="ssd-lead">
+                <b>${fmt(shared_total)}</b> ${__("unit(s) will be taken from Global Batch free stock and reserved for")} <b>${esc(opts.target)}</b>.
+            </div>
+            <div class="ssd-scroll">
+                <table class="ssd-table">
+                    <colgroup>
+                        <col style="width:40%">
+                        <col style="width:15%">
+                        <col style="width:15%">
+                        <col style="width:15%">
+                        <col style="width:15%">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th class="ssd-item">${__("Item")}</th>
+                            <th>${__("Required")}</th>
+                            <th>${__("Current Batch")}<span class="ssd-unit">${__("free")}</span></th>
+                            <th>${__("Global Batch")}<span class="ssd-unit">${__("free")}</span></th>
+                            <th>${__("Shared")}<span class="ssd-unit">${__("taken now")}</span></th>
+                        </tr>
+                    </thead>
+                    <tbody>${item_rows}</tbody>
+                    <tfoot>
+                        <tr>
+                            <td class="ssd-item">${__("Total")}</td>
+                            <td data-label="${__("Required")}">${fmt(required_total)}</td>
+                            <td class="ssd-muted" data-label="${__("Current Batch free")}">&mdash;</td>
+                            <td class="ssd-muted" data-label="${__("Global Batch free")}">&mdash;</td>
+                            <td class="ssd-shared" data-label="${__("Shared")}">${fmt(shared_total)}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+    `;
+};
+
 frappe.ui.form.on('Batch Planning', {
 
     refresh: function (frm) {
@@ -162,20 +364,13 @@ frappe.ui.form.on('Batch Planning', {
                                 return;
                             }
 
-                            let item_rows = shared_rows.map(function (d) {
-                                return `
-                                    <tr>
-                                        <td style="padding:5px 8px; font-weight:600;">${d.item_code}</td>
-                                        <td style="padding:5px 8px; text-align:right;">${d.required}</td>
-                                        <td style="padding:5px 8px; text-align:right;">${d.own_free}</td>
-                                        <td style="padding:5px 8px; text-align:right;">${d.global_free === null ? "-" : d.global_free}</td>
-                                        <td style="padding:5px 8px; text-align:right; font-weight:700; color:#b45309;">${d.shared_qty}</td>
-                                    </tr>`;
-                            }).join("");
-
                             let d = new frappe.ui.Dialog({
                                 title: __("⚠️ Shared Free Stock"),
-                                size: "small",
+                                // Five columns need the room — at the default
+                                // 600px the item name wraps to three lines while
+                                // the numeric columns sit half empty.
+                                size: "large",
+                                fields: [{ fieldtype: "HTML", fieldname: "shared_stock" }],
                                 primary_action_label: __("Continue"),
                                 primary_action: function () {
                                     d.hide();
@@ -185,24 +380,13 @@ frappe.ui.form.on('Batch Planning', {
                                 secondary_action: function () { d.hide(); }
                             });
 
-                            d.body.innerHTML = `
-                                <p style="font-size:13px; margin-bottom:10px;">
-                                    <b>${r.message.shared_stock_required}</b> unit(s) will be taken from
-                                    other batches' free stock and reserved for <b>${frm.doc.name}</b>.
-                                </p>
-                                <table class="table table-bordered" style="width:100%; font-size:12px; margin-bottom:0;">
-                                    <thead style="background:#f1f5f9;">
-                                        <tr>
-                                            <th style="padding:5px 8px;">Item</th>
-                                            <th style="padding:5px 8px; text-align:right;">Req</th>
-                                            <th style="padding:5px 8px; text-align:right;">This Batch</th>
-                                            <th style="padding:5px 8px; text-align:right;">Global</th>
-                                            <th style="padding:5px 8px; text-align:right;">Shared</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>${item_rows}</tbody>
-                                </table>
-                            `;
+                            d.fields_dict.shared_stock.$wrapper.html(
+                                window.render_shared_stock_table({
+                                    rows: shared_rows,
+                                    total: r.message.shared_stock_required,
+                                    target: frm.doc.name,
+                                })
+                            );
                             d.show();
                         }
                     });
@@ -1495,8 +1679,8 @@ function render_material_planning_tab(frm) {
             };
 
             let GRN_SECTIONS = {
-                gen: "Global Unapproved GRN — receipts tagged to OTHER Batch Plannings, waiting on Store Head approval.",
-                bp: "Local Unapproved GRN — receipts tagged to THIS Batch Planning, waiting on Store Head approval.",
+                gen: "Global Unapproved GRN — receipts tagged to the GLOBAL BATCH (other Batch Plannings), waiting on Store Head approval.",
+                bp: "Local Unapproved GRN — receipts tagged to the CURRENT BATCH, waiting on Store Head approval.",
             };
 
             let stock_line = function (qty, color, pending_title) {
@@ -1575,15 +1759,17 @@ function render_material_planning_tab(frm) {
                             <!-- Which line is which in the stacked cells. Dots are
                                  the light tints of the table's green and blue —
                                  the true #16a34a / #1d4ed8 disappear against this
-                                 dark header. -->
+                                 dark header. The pill sits on a dark scrim rather
+                                 than a white one so those light tints stay legible. -->
                             <div style="font-size:11px; margin-top:5px; display:inline-flex; align-items:center;
-                                        gap:9px; background:rgba(255,255,255,0.15); padding:3px 10px; border-radius:20px;">
+                                        gap:9px; background:rgba(0,0,0,0.32); border:1px solid rgba(255,255,255,0.22);
+                                        padding:3px 10px; border-radius:20px;">
                                 <span style="display:inline-flex; align-items:center; gap:5px;">
-                                    <span style="width:8px; height:8px; border-radius:50%; background:#86efac; display:inline-block;"></span>Top = Global
+                                    <span style="width:8px; height:8px; border-radius:50%; background:#86efac; display:inline-block;"></span>Top = Global Batch
                                 </span>
                                 <span style="opacity:0.45;">|</span>
                                 <span style="display:inline-flex; align-items:center; gap:5px;">
-                                    <span style="width:8px; height:8px; border-radius:50%; background:#93c5fd; display:inline-block;"></span>Bottom = This Batch
+                                    <span style="width:8px; height:8px; border-radius:50%; background:#93c5fd; display:inline-block;"></span>Bottom = Current Batch
                                 </span>
                             </div>
                         </div>
@@ -1600,15 +1786,15 @@ function render_material_planning_tab(frm) {
                                     <th style="${th_style("left")}">Item Name</th>
                                     <th style="${th_style()}">UOM</th>
                                     <th style="${th_style()}">Qty Req</th>
-                                    <th style="${th_style()}" title="Top (green) = OTHER BATCHES: stock tagged to a different Batch Planning, same Project and store. Bottom (blue) = THIS BATCH: its Main Wh stock plus its own Lab Wise. Untagged stock is in neither line. Other Batches carries no Lab figure — material drawn into a batch's Lab is committed to that batch's process.">Total Stock</th>
-                                    <th style="${th_style()}" title="Physical stock in this Employee Function's main store, tagged by the batch that bought it. Top (green) = OTHER Batch Plannings, bottom (blue) = THIS batch. Untagged stock counts in neither line, so it cannot be allocated. Reserved qty is not shown here — what is left unreserved appears under Free Qty.">Main Wh</th>
-                                    <th style="${th_style()}" title="Qty reserved by THIS Batch Planning through Material Allocation. Other batches' reservations are not shown in this table; their effect is already subtracted from the green line under Free Qty. Deallocated, Stock Entry Done and cancelled allocations are excluded: they no longer hold stock.">Allocated</th>
-                                    <th style="${th_style()}" title="Unreserved tagged stock. Top (green) = OTHER batches' Main Wh minus their Allocated — material they bought but have not reserved, which this batch may borrow after confirming. Bottom (blue) = THIS batch's Main Wh minus its own Allocated. The two sets are disjoint, so an allocation may draw on their SUM: this batch's own free stock is spent first, and only the remainder needs confirmation.">Free Qty</th>
-                                    <th style="${th_style()}" title="Qty shifted from Main Wh to Lab for this batch only. No GEN or global equivalent — another batch's Lab stock is not part of the shared pool.">Lab Wise</th>
-                                    <th style="${th_style()}" title="Approved Purchase-type MR qty not yet covered by an approved Purchase Order. Draft and pending-approval MRs are excluded entirely, and a draft or pending PO does not retire the qty — only an approved PO does. Material Transfer / Issue / Manufacture requests are excluded: they are not procurement. Top = GEN (other batches), bottom = BP (this batch). Separate pools — never add them.">Open MR</th>
-                                    <th style="${th_style()}" title="Approved PO qty not yet covered by a Store-Head-approved GRN. Draft and pending-approval POs are excluded entirely, and a draft or pending GRN does not retire the qty — only an approved one does. Top = GEN (other batches), bottom = BP (this batch). Separate pools — never add them.">Open PO</th>
-                                    <th style="${th_style()}" title="Goods physically received but NOT yet approved by Store Head, so not usable stock. Two sections: top (green) = Global Unapproved GRN, receipts tagged to OTHER Batch Plannings; bottom (blue) = Local Unapproved GRN, receipts tagged to THIS batch. Receipts tagged to no batch appear in neither, exactly as for Open MR and Open PO. Separate pools — never add them. On Store Head approval a receipt leaves this column immediately and its qty shows up as real stock instead. Visibility only: no calculation subtracts this column, because Open PO already carries the same units until the receipt is approved.">Unapproved GRN</th>
-                                    <th style="${th_style()}" title="Qty Req − Main Wh − Lab Wise − Open MR − Open PO, using this batch's (BP) figures only. Unapproved GRN is NOT subtracted: Open PO already carries those units until the receipt is approved, and subtracting both would credit the same goods twice. GEN is never used for coverage: it is other batches' open demand, material they have already committed to.">Net Req</th>
+                                    <th style="${th_style()}" title="Top (green) = GLOBAL BATCH: stock tagged to a different Batch Planning, same Project and store. Bottom (blue) = CURRENT BATCH: its Main Wh stock plus its own Lab Wise. Untagged stock is in neither line. Global Batch carries no Lab figure — material drawn into a batch's Lab is committed to that batch's process.">Total Stock</th>
+                                    <th style="${th_style()}" title="Physical stock in this Employee Function's main store, tagged by the batch that bought it. Top (green) = GLOBAL BATCH (other Batch Plannings), bottom (blue) = CURRENT BATCH. Untagged stock counts in neither line, so it cannot be allocated. Reserved qty is not shown here — what is left unreserved appears under Free Qty.">Main Wh</th>
+                                    <th style="${th_style()}" title="Qty reserved by the CURRENT BATCH through Material Allocation. Global Batch reservations are not shown in this table; their effect is already subtracted from the green line under Free Qty. Deallocated, Stock Entry Done and cancelled allocations are excluded: they no longer hold stock.">Allocated</th>
+                                    <th style="${th_style()}" title="Unreserved tagged stock. Top (green) = GLOBAL BATCH Main Wh minus its Allocated — material other batches bought but have not reserved, which the Current Batch may borrow after confirming. Bottom (blue) = CURRENT BATCH Main Wh minus its own Allocated. The two sets are disjoint, so an allocation may draw on their SUM: the Current Batch's own free stock is spent first, and only the remainder needs confirmation.">Free Qty</th>
+                                    <th style="${th_style()}" title="Qty shifted from Main Wh to Lab for the Current Batch only. No GEN or Global Batch equivalent — another batch's Lab stock is not part of the shared pool.">Lab Wise</th>
+                                    <th style="${th_style()}" title="Approved Purchase-type MR qty not yet covered by an approved Purchase Order. Draft and pending-approval MRs are excluded entirely, and a draft or pending PO does not retire the qty — only an approved PO does. Material Transfer / Issue / Manufacture requests are excluded: they are not procurement. Top = GEN (Global Batch), bottom = BP (Current Batch). Separate pools — never add them.">Open MR</th>
+                                    <th style="${th_style()}" title="Approved PO qty not yet covered by a Store-Head-approved GRN. Draft and pending-approval POs are excluded entirely, and a draft or pending GRN does not retire the qty — only an approved one does. Top = GEN (Global Batch), bottom = BP (Current Batch). Separate pools — never add them.">Open PO</th>
+                                    <th style="${th_style()}" title="Goods physically received but NOT yet approved by Store Head, so not usable stock. Two sections: top (green) = Global Unapproved GRN, receipts tagged to the GLOBAL BATCH; bottom (blue) = Local Unapproved GRN, receipts tagged to the CURRENT BATCH. Receipts tagged to no batch appear in neither, exactly as for Open MR and Open PO. Separate pools — never add them. On Store Head approval a receipt leaves this column immediately and its qty shows up as real stock instead. Visibility only: no calculation subtracts this column, because Open PO already carries the same units until the receipt is approved.">Unapproved GRN</th>
+                                    <th style="${th_style()}" title="Qty Req − Main Wh − Lab Wise − Open MR − Open PO, using the Current Batch's (BP) figures only. Unapproved GRN is NOT subtracted: Open PO already carries those units until the receipt is approved, and subtracting both would credit the same goods twice. GEN is never used for coverage: it is Global Batch open demand, material other batches have already committed to.">Net Req</th>
                                     <th style="${th_style()}">Usable</th>
                                     <th style="${th_style()}">Expired Qty</th>
                                 </tr>
