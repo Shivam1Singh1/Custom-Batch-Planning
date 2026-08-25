@@ -1490,6 +1490,7 @@ def get_material_planning_data(doc_name):
         allocated_qty = figures["bp_allocated"]
         global_allocated = figures["other_allocated_total"]
         bp_global_allocated = figures["bp_global_allocated"]
+        bp_local_allocated = figures["bp_local_allocated"]
 
         global_free_stock = figures["other_free_stock"]
         bp_free_stock = figures["bp_free_stock"]
@@ -1555,11 +1556,31 @@ def get_material_planning_data(doc_name):
             item_code, employee_function, doc.project, doc.name, "BP"
         )
 
+        # BOTH allocation sources are credited, by explicit business decision:
+        # an allocation locks material to this batch, and locked material is not
+        # to be purchased again. The two terms are NOT symmetric, though, and the
+        # difference matters when reading this figure:
+        #
+        #   bp_global_allocated  borrowed from other batches' tagged stock. Those
+        #                        units are outside bp_main_stock, so this term is
+        #                        the only place they are credited.
+        #
+        #   bp_local_allocated   drawn from this batch's OWN free stock, so these
+        #                        units are already inside bp_main_stock and are
+        #                        credited a second time here. Deliberate. On any
+        #                        row where bp_main_stock < qty_required, Net Req
+        #                        therefore reads low by the locally-allocated qty
+        #                        and under-states what must be bought.
+        #
+        # Anyone reconciling a purchase shortfall against this column should
+        # start here: subtract Allocated's local line back out to get the
+        # physically-backed requirement.
         net_requirement = max(
             qty_required
             - bp_main_stock
             - lab_stock
             - bp_global_allocated
+            - bp_local_allocated
             - bp_mr_qty
             - bp_po_qty,
             0.0,
@@ -1582,7 +1603,7 @@ def get_material_planning_data(doc_name):
                 "total_free_stock": round(total_free_stock, 2),
                 "lab_stock": round(lab_stock, 2),
                 "allocated_qty": round(allocated_qty, 2),
-                "local_allocated_qty": round(figures["bp_local_allocated"], 2),
+                "local_allocated_qty": round(bp_local_allocated, 2),
                 "global_allocated_qty": round(bp_global_allocated, 2),
                 "bp_free_stock": round(bp_free_stock, 2),
                 "global_allocated": round(global_allocated, 2),

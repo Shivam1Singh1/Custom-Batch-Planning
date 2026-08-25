@@ -90,6 +90,7 @@ class TestUnapprovedGRN(unittest.TestCase):
                     - row["bp_main_stock"]
                     - row["lab_stock"]
                     - row["global_allocated_qty"]
+                    - row["local_allocated_qty"]
                     - row["bp_mr_qty"]
                     - row["bp_po_qty"],
                     0.0,
