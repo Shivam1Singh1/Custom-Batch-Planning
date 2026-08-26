@@ -1,7 +1,6 @@
 import json
 import frappe
 from frappe.model.document import Document
-from frappe.model.naming import make_autoname
 from frappe.utils import getdate, flt, add_months
 
 from custom_batch_planning.custom_batch_planning.doctype.batch_planning_settings.batch_planning_settings import (
@@ -263,6 +262,42 @@ class BatchPlanning(Document):
                 "function_head_name"
             )
 
+        # Second safety net behind the before_save handler in batch_planning.js,
+        # which waits for the async counter calls to land. If a row still has no
+        # id by the time the document reaches the server, generate it here
+        # through the SAME function the client calls, so the format and its
+        # scoping (Slot Opening + Batch Type) are identical either way.
+        #
+        # This replaces a BC-{yy}-{mm}-{###} fallback that used to sit further
+        # down, after the duplicate checks. That fallback was NOT dead code: it
+        # fired whenever the client lost the race and stamped a second,
+        # incompatible format onto rows that should have read
+        # SO-26-08-006-MFG-01. It left no trace in the database only because the
+        # client normally wins. Confirmed 0 rows carry a BC- id before removal.
+        #
+        # Runs BEFORE the duplicate checks below, so a generated id is validated
+        # exactly like a client-assigned one — the old fallback sat after them
+        # and skipped both.
+        for row in self.custom_batch_details or []:
+            if row.batch_planning_id:
+                continue
+            if not (row.slot_opening_id and row.batch_type):
+                frappe.throw(
+                    f"Row {row.idx}: cannot generate a Batch Planning ID without both "
+                    f"Slot Opening and Batch Type. Please set them and save again."
+                )
+            # Identity, not `r.name != row.name`: an unsaved child row has no
+            # name yet, so comparing names made every row fail to exclude itself
+            # and two rows of the same batch type both received MFG-03.
+            assigned = [
+                r.batch_planning_id
+                for r in self.custom_batch_details
+                if r.batch_planning_id and r is not row
+            ]
+            row.batch_planning_id = get_next_batch_counter(
+                row.slot_opening_id, row.batch_type, json.dumps(assigned)
+            )
+
         for row in self.custom_batch_details or []:
             if row.batch_planning_id:
                 existing_bc = frappe.db.get_value(
@@ -297,17 +332,6 @@ class BatchPlanning(Document):
                 frappe.throw(
                     f"Row {row.idx}: Please select a Finished Item before selecting a BOM."
                 )
-
-        for row in self.custom_batch_details or []:
-            if not row.batch_planning_id and row.slot_booking_date:
-                try:
-                    parsed_date = frappe.utils.getdate(row.slot_booking_date)
-                    year = parsed_date.strftime("%y")
-                    month = parsed_date.strftime("%m")
-                    prefix = f"BC-{year}-{month}-.###"
-                    row.batch_planning_id = make_autoname(prefix)
-                except Exception:
-                    pass
 
         if self.slot_opening:
             planning_capacity_data = frappe.get_all(
@@ -497,10 +521,34 @@ def create_bulk_material_allocations(batch_planning_name):
 
     shared_rows = []
     shared_total = 0.0
+    lab_covered = []
 
     for item in consolidated_items:
         item_code = item["item_code"]
         qty_required = flt(item["qty"])
+
+        # Lab Wise stock is material this batch ALREADY HOLDS — issued out of the
+        # store under its own tag. Allocating against the gross BOM quantity
+        # ignored it and reserved the same units twice: BP-29-08-001 needed 100
+        # of CN02010004 with all 100 sitting in its own lab, and still proposed
+        # borrowing 100 from the global pool, taking them off other batches that
+        # had nothing. Across submitted plans that was 586 units over-reserved on
+        # 9 of 17 lines.
+        #
+        # Only the shortfall is allocatable. Where the lab covers the requirement
+        # outright there is nothing to reserve and the item is dropped entirely.
+        lab_stock = _stock_qty(
+            item_code,
+            warehouse,
+            parent_doc.project,
+            batch_planning_name,
+            "BP",
+            in_main=False,
+        )
+        outstanding = max(qty_required - lab_stock, 0.0)
+        if outstanding <= 0:
+            lab_covered.append(item_code)
+            continue
 
         figures = free_stock_figures(
             item_code,
@@ -518,7 +566,7 @@ def create_bulk_material_allocations(batch_planning_name):
         other_free = pools["global_free"]
         cap = pools["capacity"]
 
-        allocate_qty = min(qty_required, cap)
+        allocate_qty = min(outstanding, cap)
         if allocate_qty <= 0:
             continue
 
@@ -538,7 +586,12 @@ def create_bulk_material_allocations(batch_planning_name):
                 "shared_qty": round(from_shared, 2),
             })
 
-        ma_data["material_allocation"].append({
+        # quantity_required stays the GROSS BOM figure: it is what the batch
+        # consumes, and Material Allocation.validate uses it as the ceiling. But
+        # that same validate demands a Reason whenever allocate_qty differs from
+        # it, so a partially lab-covered row would block on a reason the system
+        # itself decided. Fill it in rather than making the user retype it.
+        row = {
             "doctype": "Material Allocation Item",
             "parenttype": "Material Allocation",
             "parentfield": "material_allocation",
@@ -552,9 +605,20 @@ def create_bulk_material_allocations(batch_planning_name):
             "local_allocated_qty": round(from_own, 2),
             "global_allocated_qty": round(from_shared, 2),
             "stock_available": round(cap, 2),
-        })
+        }
+        if lab_stock > 0:
+            row["reason"] = (
+                f"{round(lab_stock, 2)} {item['uom']} already held in lab stock; "
+                f"allocating the {round(allocate_qty, 2)} shortfall only."
+            )
+        ma_data["material_allocation"].append(row)
 
     if not ma_data["material_allocation"]:
+        if lab_covered:
+            frappe.throw(
+                "Nothing to allocate — every item on this Batch Planning is already "
+                "covered by stock this batch holds in the lab."
+            )
         frappe.throw(
             "No free stock is available for any item on this Batch Planning — "
             "neither its own nor the shared pool. Material Allocation cannot be created."
@@ -1696,92 +1760,52 @@ def temp_db_fix():
 
 @frappe.whitelist()
 def get_batch_wise_shortages(doc_name):
+    """MR lines = exactly the rows Material Planning shows with Net Req > 0.
+
+    Deliberately delegates to get_material_planning_data rather than recomputing
+    the requirement. This function used to carry its own formula, which had
+    drifted from net_requirement in four terms:
+
+      Main Wh   read straight off the Stock Ledger instead of the settled figure
+                free_stock_figures returns, so a batch carrying a cross-batch
+                deficit (see settle_cross_batch_draw) never saw it. BP-26-10-001
+                read Main Wh as +2 where planning read -58, and reported no
+                shortage on an item planning wanted 60 of.
+
+      Lab Wise  omitted entirely, and omitted TWICE OVER: issuing stock from the
+                store to a lab leaves a negative on Main Wh, which was then
+                subtracted from the requirement — i.e. added to it. A batch
+                needing 40 with all 40 already in its own lab asked to buy 80.
+
+      Allocated  both the local and global terms were missing, so material
+                 locked to this batch would have been purchased a second time
+                 once any allocation existed.
+
+    Reusing the single formula is what keeps the MR button and the Material
+    Planning tab from disagreeing again; the guards for a missing Employee
+    Function and a missing store warehouse are preserved because
+    get_material_planning_data raises the same two.
+
+    Lab stock counts as coverage, exactly as Net Req has it: material already
+    sitting in this batch's lab is not re-purchased.
+    """
     doc = frappe.get_doc("Batch Planning", doc_name)
-    
-    item_requirements = {}
-    for row in doc.custom_batch_details or []:
-        if not row.bom_list or not row.batch_planning_id:
-            continue
-
-        batch_key = f"{doc.name}-{row.idx}"
-        bom_store = frappe.db.get_value(
-            "Batch BOM Store after Edit", {"batch_id": batch_key}, "name"
-        )
-
-        use_store = False
-        items = []
-        if bom_store:
-            store_doc = frappe.get_doc("Batch BOM Store after Edit", bom_store)
-            items = store_doc.bom_components or []
-            use_store = True
-        else:
-            bom = frappe.get_doc("BOM", row.bom_list)
-            items = bom.exploded_items or bom.items or []
-
-        for item in items:
-            item_code = item.item_code
-            item_name = item.item_name
-            uom = item.uom if use_store else (item.stock_uom or item.uom)
-            qty_needed = flt(
-                item.qty if use_store
-                else (item.qty_consumed_per_unit or item.stock_qty or item.qty)
-            )
-            
-            if item_code not in item_requirements:
-                item_requirements[item_code] = {
-                    "item_code": item_code,
-                    "item_name": item_name,
-                    "uom": uom,
-                    "qty_needed": 0.0
-                }
-            item_requirements[item_code]["qty_needed"] += qty_needed
-
-    employee_function = doc.custom_employee_function
-    if not employee_function:
-        frappe.throw("Employee Function is not set on this document.")
-
-    ef_doc = frappe.get_doc("Employee Function", employee_function)
-    warehouse = next(
-        (r.store_warehouse for r in (ef_doc.table_bukm or []) if r.store_warehouse),
-        None,
-    )
-    if not warehouse:
-        frappe.throw(f"No store warehouse found in Employee Function '{employee_function}'.")
+    planning = get_material_planning_data(doc_name)
+    schedule_date = frappe.utils.add_days(frappe.utils.today(), 1)
 
     shortages = []
-    for item_code, req in item_requirements.items():
-        main_stock = flt(frappe.db.sql(
-            """
-            SELECT IFNULL(SUM(actual_qty), 0)
-            FROM `tabStock Ledger Entry`
-            WHERE item_code = %s
-            AND warehouse = %s
-            AND batch_planning_id = %s
-            AND project = %s
-            AND is_cancelled = 0
-            """,
-            (item_code, warehouse, doc.name, doc.project)
-        )[0][0] or 0.0)
-
-        bp_mr_qty, _mr_count, _mr_docs = _open_mr(
-            item_code, employee_function, doc.project, doc.name, "BP"
-        )
-        bp_po_qty, _po_count, _po_docs = _open_po(
-            item_code, employee_function, doc.project, doc.name, "BP"
-        )
-
-        shortage_qty = req["qty_needed"] - main_stock - bp_mr_qty - bp_po_qty
-
-        if shortage_qty <= 0:
+    for row in planning["results"]:
+        net_requirement = flt(row.get("net_requirement"))
+        if net_requirement <= 0:
             continue
 
         shortages.append({
-            "item_code": item_code,
-            "item_name": req["item_name"],
-            "qty": round(shortage_qty, 4),
-            "uom": req["uom"],
+            "item_code": row["item_code"],
+            "item_name": row.get("item_name"),
+            "qty": net_requirement,
+            "uom": row.get("uom"),
             "custom_batch_planning_no": doc.name,
-            "schedule_date": frappe.utils.add_days(frappe.utils.today(), 1)
+            "schedule_date": schedule_date,
         })
 
     return sorted(shortages, key=lambda x: x["item_code"])

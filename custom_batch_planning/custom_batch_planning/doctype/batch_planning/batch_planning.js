@@ -4,6 +4,50 @@ if (typeof XLSX === 'undefined') {
     document.head.appendChild(s);
 }
 
+const SLOT_ENDED_MSG = __("Slot period has ended — action not available");
+
+// Planning End Date of the linked Slot Master, or null when no Slot Master is
+// set. Six older Batch Plannings have none; a null end date must never block,
+// so callers treat null as "still open" rather than "expired".
+//
+// The date is not stored on Batch Planning, so it has to be fetched. Cached per
+// Slot Master because refresh() fires often and the value cannot change under
+// a submitted document.
+function resolve_slot_end_date(frm) {
+    if (!frm.doc.custom_slot_master) return Promise.resolve(null);
+    if (frm._slot_end_master === frm.doc.custom_slot_master) {
+        return Promise.resolve(frm._slot_end_date);
+    }
+    return frappe.db
+        .get_value('Slot Master List', frm.doc.custom_slot_master, 'batch_end_date')
+        .then(function (r) {
+            frm._slot_end_master = frm.doc.custom_slot_master;
+            frm._slot_end_date = (r && r.message) ? r.message.batch_end_date : null;
+            return frm._slot_end_date;
+        });
+}
+
+// Grey out a custom button and explain why on hover. A GROUPED button is an
+// <a> inside the Create dropdown, where prop('disabled') has no effect and the
+// click still fires — which is why every gated handler ALSO calls
+// slot_blocked() as its first statement. That guard, not this styling, is what
+// actually stops the action.
+function mark_slot_expired($btn) {
+    $btn.prop('disabled', true)
+        .attr('title', SLOT_ENDED_MSG)
+        .css({ opacity: 0.55, cursor: 'not-allowed' });
+}
+
+function slot_blocked(slot_expired) {
+    if (!slot_expired) return false;
+    frappe.msgprint({
+        title: __("Slot Closed"),
+        message: SLOT_ENDED_MSG,
+        indicator: "orange"
+    });
+    return true;
+}
+
 // Body markup for the "⚠️ Shared Free Stock" confirmation, rendered into the
 // dialog's HTML field. An identical copy lives in material_allocation.js — keep
 // the two in step; each form only loads its own doctype's script, so neither can
@@ -284,36 +328,35 @@ frappe.ui.form.on('Batch Planning', {
             render_stock_entry_tab(frm);
             render_item_issue_tab(frm);
 
-            let planning_passed = false;
-            if (frm.doc.slot_opening_table && frm.doc.slot_opening_table.length > 0) {
-                let latest_date = null;
-                frm.doc.slot_opening_table.forEach(row => {
-                    if (row.slot_booking_date) {
-                        let d = frappe.datetime.str_to_obj(row.slot_booking_date);
-                        if (!latest_date || d > latest_date) {
-                            latest_date = d;
-                        }
-                    }
-                });
-                
-                if (latest_date) {
-                    let today = frappe.datetime.str_to_obj(frappe.datetime.get_today());
-                    if (latest_date < today) {
-                        planning_passed = true;
-                    }
-                }
-            }
+            // The gate is the linked Slot Master's Planning End Date. It
+            // REPLACES the old latest-slot_booking_date check: the booking rows
+            // and the master can disagree in both directions — BP-26-07-004
+            // books a week past its master's end, BP-26-06-004's master runs a
+            // week past its last booking — and the master is the document that
+            // actually defines the period.
+            //
+            // Run Material Planning is deliberately NOT gated. It only renders
+            // a read-only tab, and an expired batch still has to be readable;
+            // only the two document-creating actions are blocked.
+            //
+            // Buttons are removed inside the callback rather than before the
+            // fetch, so two refreshes in flight at once cannot leave a
+            // duplicate pair behind.
+            resolve_slot_end_date(frm).then(function (end_date) {
+                let today = frappe.datetime.str_to_obj(frappe.datetime.get_today());
+                let slot_expired = !!end_date
+                    && frappe.datetime.str_to_obj(end_date) < today;
 
-            frm.remove_custom_button(__("Run Material Planning"));
-            frm.remove_custom_button(__("Material Allocation"), __("Create"));
-            frm.remove_custom_button(__("Material Request"), __("Create"));
+                frm.remove_custom_button(__("Run Material Planning"));
+                frm.remove_custom_button(__("Material Allocation"), __("Create"));
+                frm.remove_custom_button(__("Material Request"), __("Create"));
 
-            if (!planning_passed) {
                 frm.add_custom_button(__("Run Material Planning"), function () {
                     render_material_planning_tab(frm);
                 }).addClass("btn-primary");
 
-                frm.add_custom_button(__("Material Allocation"), function () {
+                let $alloc_btn = frm.add_custom_button(__("Material Allocation"), function () {
+                    if (slot_blocked(slot_expired)) return;
                     frappe.call({
                         method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.create_bulk_material_allocations",
                         args: { batch_planning_name: frm.doc.name },
@@ -351,6 +394,12 @@ frappe.ui.form.on('Batch Planning', {
                                                 child.global_free_qty = row.global_free_qty;
                                                 child.local_allocated_qty = row.local_allocated_qty;
                                                 child.global_allocated_qty = row.global_allocated_qty;
+                                                // Set server-side when lab stock trimmed the
+                                                // allocation. Material Allocation.validate makes
+                                                // Reason mandatory whenever Qty Requested differs
+                                                // from BOM Qty, so dropping it here would block
+                                                // the save on a deviation the system chose.
+                                                child.reason = row.reason;
                                             });
                                         }
 
@@ -391,8 +440,10 @@ frappe.ui.form.on('Batch Planning', {
                         }
                     });
                 }, __("Create"));
+                if (slot_expired) mark_slot_expired($alloc_btn);
 
-                frm.add_custom_button(__("Material Request"), function () {
+                let $mr_btn = frm.add_custom_button(__("Material Request"), function () {
+                    if (slot_blocked(slot_expired)) return;
                     frappe.call({
                         method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_batch_wise_shortages",
                         args: { doc_name: frm.doc.name },
@@ -436,7 +487,8 @@ frappe.ui.form.on('Batch Planning', {
                         }
                     });
                 }, __("Create"));
-            }
+                if (slot_expired) mark_slot_expired($mr_btn);
+            });
 
         } else {
             frm.remove_custom_button(__("Run Material Planning"));
@@ -674,6 +726,58 @@ frappe.ui.form.on('Batch Planning', {
                     });
                 });
             }
+        });
+    },
+
+    before_save: function (frm) {
+        // The batch_type trigger assigns batch_planning_id through an async
+        // frappe.call chained onto frm._counter_queue. Nothing used to wait for
+        // it, so a quick save reached the server with the field still empty --
+        // and validate() then stamped it with a SECOND, incompatible format
+        // (BC-29-08-001 instead of SO-26-08-006-MFG-01). See the server-side
+        // guard that replaced that fallback in batch_planning.py.
+        //
+        // Returning a promise from before_save makes frm.save() await it, so the
+        // document is never sent until every row carries its id. Rows the trigger
+        // never fired for are filled in here.
+        //
+        // Sequential via reduce, NOT Promise.all: get_next_batch_counter is
+        // MAX-based, so each new id has to be visible to the next call through
+        // exclude_ids. Fired concurrently, two rows of the same batch type would
+        // both compute the same MAX+1 and collide.
+        let queue = frm._counter_queue || Promise.resolve();
+
+        return queue.then(function () {
+            let pending = (frm.doc.custom_batch_details || []).filter(
+                r => !r.batch_planning_id && r.slot_opening_id && r.batch_type
+            );
+            if (!pending.length) return;
+
+            return pending.reduce(function (chain, row) {
+                return chain.then(function () {
+                    // Identity rather than name comparison, matching the server
+                    // guard: a row that fails to exclude itself hands the same
+                    // number back on the next call.
+                    let assigned = (frm.doc.custom_batch_details || [])
+                        .filter(r => r.batch_planning_id && r !== row)
+                        .map(r => r.batch_planning_id);
+
+                    return frappe.call({
+                        method: 'custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_next_batch_counter',
+                        args: {
+                            slot_opening_id: row.slot_opening_id,
+                            batch_type: row.batch_type,
+                            exclude_ids: JSON.stringify(assigned)
+                        }
+                    }).then(function (r) {
+                        if (r && r.message) {
+                            return frappe.model.set_value(
+                                row.doctype, row.name, 'batch_planning_id', r.message
+                            );
+                        }
+                    });
+                });
+            }, Promise.resolve());
         });
     },
 
