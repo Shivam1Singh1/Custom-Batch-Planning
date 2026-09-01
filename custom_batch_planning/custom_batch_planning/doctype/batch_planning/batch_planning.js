@@ -698,7 +698,6 @@ frappe.ui.form.on('Batch Planning', {
                                     child.slot_opening_id = frm.doc.slot_opening;
                                     child.slot_booking_date = slot.slot_booking_date;
                                     child.reason = slot.reason;
-                                    child.status = "Approved";
                                     added++;
                                 }
                             });
@@ -730,6 +729,10 @@ frappe.ui.form.on('Batch Planning', {
     },
 
     before_save: function (frm) {
+        // Last point at which the local name is still readable; after_save needs it
+        // to move BOM edits stored against it onto the name the server assigns.
+        if (frm.is_new()) frm._local_name = frm.doc.name;
+
         // The batch_type trigger assigns batch_planning_id through an async
         // frappe.call chained onto frm._counter_queue. Nothing used to wait for
         // it, so a quick save reached the server with the field still empty --
@@ -782,34 +785,21 @@ frappe.ui.form.on('Batch Planning', {
     },
 
     after_save: function (frm) {
+        // BOM edits made before the first save are filed under the throwaway local
+        // name, so they have to be moved onto the real one. Match on the name this
+        // form actually had: the previous filter looked for `new-batch-creation-%`,
+        // which Frappe never generates for this doctype, so every such edit was
+        // stranded and the dialog fell back to the source BOM on reopen.
+        let local_name = frm._local_name;
+        frm._local_name = null;
+
+        if (!local_name || local_name === frm.doc.name) return;
+
         frappe.call({
-            method: 'frappe.client.get_list',
+            method: 'custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.rekey_batch_bom_store',
             args: {
-                doctype: 'Batch BOM Store after Edit',
-                filters: [
-                    ['batch_id', 'like', 'new-batch-creation-%']
-                ],
-                fields: ['name', 'batch_id'],
-                limit: 20
-            },
-            callback: function (r) {
-                if (!r.message || !r.message.length) return;
-                r.message.forEach(function (doc) {
-                    let parts = doc.batch_id.split('-');
-                    let idx = parts[parts.length - 1];
-                    let new_key = `${frm.doc.name}-${idx}`;
-                    frappe.call({
-                        method: 'frappe.client.set_value',
-                        args: {
-                            doctype: 'Batch BOM Store after Edit',
-                            name: doc.name,
-                            fieldname: {
-                                'batch_id': new_key,
-                                'custom_batch_creation_id': frm.doc.name
-                            }
-                        }
-                    });
-                });
+                local_name: local_name,
+                doc_name: frm.doc.name
             }
         });
     },
@@ -876,13 +866,27 @@ frappe.ui.form.on('Batch Planning Detail', {
                         if (r.message) {
                             frappe.model.set_value(cdt, cdn, 'batch_planning_id', r.message);
                         }
-                        if (frm.doc.finished_item) {
-                            frappe.model.set_value(cdt, cdn, 'finished_item', frm.doc.finished_item);
-                            if (frm.doc.bom_list) {
-                                frappe.model.set_value(cdt, cdn, 'bom_list', frm.doc.bom_list);
-                            }
+
+                        if (!frm.doc.finished_item) {
+                            resolve();
+                            return;
                         }
-                        resolve();
+
+                        // Chained, not fired side by side. Setting finished_item runs
+                        // the row's own finished_item trigger, which blanks bom_list.
+                        // Both set_values used to be issued without waiting, so that
+                        // blanking could land after the BOM was written and leave the
+                        // row carrying no BOM -- which is how a row reaches Approved
+                        // with an empty Bom List while its siblings are filled in.
+                        frappe.model
+                            .set_value(cdt, cdn, 'finished_item', frm.doc.finished_item)
+                            .then(function () {
+                                if (!frm.doc.bom_list) return;
+                                return frappe.model.set_value(
+                                    cdt, cdn, 'bom_list', frm.doc.bom_list
+                                );
+                            })
+                            .then(resolve, resolve);
                     }
                 });
             });
@@ -941,7 +945,7 @@ function open_bom_dialog(frm, cdt, cdn, bom_name, batch_type) {
         ? `${frm.doc.name}-${row_data.idx}`
         : '';
 
-    if (!batch_key) {
+    function load_source_bom() {
         frappe.call({
             method: 'frappe.client.get',
             args: { doctype: 'BOM', name: bom_name },
@@ -960,69 +964,34 @@ function open_bom_dialog(frm, cdt, cdn, bom_name, batch_type) {
                         qty: item.stock_qty || item.qty || 0
                     };
                 });
-                render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, bom_items, null);
+                render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, bom_items, batch_key);
             }
         });
+    }
+
+    if (!batch_key) {
+        load_source_bom();
         return;
     }
 
+    // One call: the server picks the newest store row for this key, so a duplicate
+    // left behind by an older save can no longer shadow the current edit.
     frappe.call({
-        method: 'frappe.client.get_list',
-        args: {
-            doctype: 'Batch BOM Store after Edit',
-            filters: { batch_id: batch_key },
-            fields: ['name'],
-            limit: 1
-        },
+        method: 'custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_batch_bom_store',
+        args: { batch_key: batch_key },
         callback: function (r) {
-            if (r.message && r.message.length > 0) {
-                frappe.call({
-                    method: 'frappe.client.get',
-                    args: {
-                        doctype: 'Batch BOM Store after Edit',
-                        name: r.message[0].name
-                    },
-                    callback: function (res) {
-                        if (!res.message) return;
-                        let items = (res.message.bom_components || []).map(function (row) {
-                            return {
-                                item_code: row.item_code,
-                                item_name: row.item_name,
-                                uom: row.uom,
-                                qty: row.qty
-                            };
-                        });
-                        render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, items, r.message[0].name);
-                    }
-                });
-            } else {
-                frappe.call({
-                    method: 'frappe.client.get',
-                    args: { doctype: 'BOM', name: bom_name },
-                    freeze: true,
-                    freeze_message: 'Loading BOM Items...',
-                    callback: function (r) {
-                        if (!r.message) {
-                            frappe.msgprint({ title: 'Error', message: 'BOM not found!', indicator: 'red' });
-                            return;
-                        }
-                        let bom_items = (r.message.exploded_items || r.message.items || []).map(function (item) {
-                            return {
-                                item_code: item.item_code || '',
-                                item_name: item.item_name || '',
-                                uom: item.stock_uom || item.uom || '',
-                                qty: item.stock_qty || item.qty || 0
-                            };
-                        });
-                        render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, bom_items, null);
-                    }
-                });
+            let store = r.message;
+            if (!store || !(store.bom_components || []).length) {
+                load_source_bom();
+                return;
             }
+            render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly,
+                store.bom_components, batch_key);
         }
     });
 }
 
-function render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, final_items, existing_doc_name) {
+function render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, final_items, batch_key) {
 
     let fields = [];
 
@@ -1097,12 +1066,15 @@ function render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, fin
                 return;
             }
 
+            // Recompute rather than trust the key the dialog opened with: the form
+            // may have been saved in the meantime, which renames the document and
+            // moves the store row along with it.
             let row_data = locals[cdt] && locals[cdt][cdn];
-            let batch_key = (frm.doc.name && row_data && row_data.idx)
+            let save_key = (frm.doc.name && row_data && row_data.idx)
                 ? `${frm.doc.name}-${row_data.idx}`
-                : '';
+                : batch_key;
 
-            if (!batch_key) {
+            if (!save_key) {
                 frappe.msgprint({
                     title: '⚠️ Cannot Save',
                     message: 'Form not saved yet. Please save the form first.',
@@ -1120,58 +1092,25 @@ function render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, fin
                 };
             });
 
-            if (existing_doc_name) {
-                frappe.call({
-                    method: 'frappe.client.get',
-                    args: {
-                        doctype: 'Batch BOM Store after Edit',
-                        name: existing_doc_name
-                    },
-                    callback: function (res) {
-                        if (!res.message) return;
-                        let doc = res.message;
-                        doc.bom_components = bom_components;
-
-                        frappe.call({
-                            method: 'frappe.client.save',
-                            args: { doc: doc },
-                            callback: function (saved) {
-                                if (saved.message) {
-                                    frappe.show_alert({
-                                        message: `✅ BOM <b>${bom_name}</b> updated — ${items.length} items saved.`,
-                                        indicator: 'green'
-                                    }, 5);
-                                    existing_doc_name = saved.message.name;
-                                    d.hide();
-                                }
-                            }
-                        });
-                    }
-                });
-            } else {
-                frappe.call({
-                    method: 'frappe.client.insert',
-                    args: {
-                        doc: {
-                            doctype: 'Batch BOM Store after Edit',
-                            batch_id: batch_key,
-                            custom_batch_creation_id: frm.doc.name,
-                            bom_name: bom_name,
-                            bom_components: bom_components
-                        }
-                    },
-                    callback: function (res) {
-                        if (res.message) {
-                            frappe.show_alert({
-                                message: `✅ BOM <b>${bom_name}</b> saved — ${items.length} items stored.`,
-                                indicator: 'green'
-                            }, 5);
-                            existing_doc_name = res.message.name;
-                            d.hide();
-                        }
-                    }
-                });
-            }
+            frappe.call({
+                method: 'custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.save_batch_bom_store',
+                args: {
+                    batch_key: save_key,
+                    bom_name: bom_name,
+                    components: JSON.stringify(bom_components)
+                },
+                freeze: true,
+                freeze_message: 'Saving BOM Items...',
+                callback: function (res) {
+                    if (!res.message) return;
+                    batch_key = save_key;
+                    frappe.show_alert({
+                        message: `✅ BOM <b>${bom_name}</b> saved — ${items.length} items stored.`,
+                        indicator: 'green'
+                    }, 5);
+                    d.hide();
+                }
+            });
         },
         secondary_action_label: is_readonly ? 'Close' : 'Cancel',
         secondary_action: function () { d.hide(); }
@@ -1592,20 +1531,26 @@ function inject_eye_buttons_once(frm, $grid_wrapper) {
         let rd = locals['Batch Planning Detail'] &&
             locals['Batch Planning Detail'][row_name];
 
+        // The static grid column only. An unqualified [data-fieldname] lookup also
+        // matches the frappe-control rendered inside this cell's .field-area (and
+        // the one in the expanded row form), so appending to the whole set puts a
+        // second eye in the row the moment it is made editable.
+        let $bom_cell = $row.find('.grid-static-col[data-fieldname="bom_list"]').first();
+        if (!$bom_cell.length) return;
+
         let bom_val = (rd && rd.bom_list) || '';
 
         if (!bom_val) {
-            bom_val = $row.find('[data-fieldname="bom_list"] .static-area').text().trim() ||
-                $row.find('[data-fieldname="bom_list"] .ellipsis').text().trim() ||
-                $row.find('[data-fieldname="bom_list"]').attr('data-value') || '';
+            bom_val = $bom_cell.find('.static-area').text().trim() ||
+                $bom_cell.find('.ellipsis').text().trim() ||
+                $bom_cell.attr('data-value') || '';
         }
 
         bom_val = bom_val.trim();
 
-        let $bom_cell = $row.find('[data-fieldname="bom_list"]');
-        if (!$bom_cell.length) return;
-
-        $bom_cell.find('.bom-eye-btn').remove();
+        // Sweep the whole row, not just the target cell, so any stray button that
+        // landed in the editable control is cleared out too.
+        $row.find('.bom-eye-btn').remove();
 
         if (!bom_val) return;
 

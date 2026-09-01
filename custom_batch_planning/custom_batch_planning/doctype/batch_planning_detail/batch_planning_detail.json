@@ -71,7 +71,8 @@
             "fieldtype": "Link",
             "in_list_view": 1,
             "label": "Bom List",
-            "options": "BOM"
+            "options": "BOM",
+            "reqd": 1
         }
     ],
     "grid_page_length": 50,

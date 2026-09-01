@@ -245,9 +245,18 @@ class BatchPlanning(Document):
                     dt = getdate(batch_start_date)
                     self.month = calendar.month_name[dt.month]
         if self.slot_opening:
+            # Cancelled plans do not hold their Slot Opening. Without the
+            # docstatus filter a cancelled Batch Planning kept the opening
+            # reserved forever: it could be neither amended nor replaced by a
+            # fresh plan, because the cancelled row itself answered this check
+            # and the slot could never be planned again.
             existing = frappe.db.get_value(
                 "Batch Planning",
-                {"slot_opening": self.slot_opening, "name": ["!=", self.name]},
+                {
+                    "slot_opening": self.slot_opening,
+                    "name": ["!=", self.name],
+                    "docstatus": ["!=", 2],
+                },
                 "name",
             )
             if existing:
@@ -305,7 +314,15 @@ class BatchPlanning(Document):
                     {"batch_planning_id": row.batch_planning_id},
                     "batch_planning",
                 )
-                if existing_bc and existing_bc != self.name:
+                # A cancelled plan no longer owns its Batches Planned - the plan
+                # amending it takes them over on approval. Without the exemption
+                # an amended plan could not even be saved, since it inherits the
+                # very ids the cancelled plan still points at.
+                if (
+                    existing_bc
+                    and existing_bc != self.name
+                    and not _is_superseded(existing_bc)
+                ):
                     frappe.throw(
                         f"⚠️ Duplicate Batch Planning ID Detected!\n\n"
                         f"<b>{row.batch_planning_id}</b> (Row {row.idx}) is already linked to "
@@ -331,6 +348,16 @@ class BatchPlanning(Document):
             if row.bom_list and not row.finished_item:
                 frappe.throw(
                     f"Row {row.idx}: Please select a Finished Item before selecting a BOM."
+                )
+            # Belt to the mandatory flag on the field. Every material calculation
+            # downstream - the consolidated components, the material planning
+            # figures, the Batches Planned record - reads bom_list and quietly
+            # skips the row when it is blank, so a row that lost its BOM plans a
+            # batch that needs no materials at all and says nothing about it.
+            if not row.bom_list:
+                frappe.throw(
+                    f"Row {row.idx}: Bom List is required. A batch cannot be planned "
+                    f"without a BOM."
                 )
 
         if self.slot_opening:
@@ -358,6 +385,31 @@ class BatchPlanning(Document):
                         f"{allowed} slot(s) for this date on Slot Opening {self.slot_opening}."
                     )
 
+    def _batches_planned_values(self, row):
+        """Field values a Batches Planned carries for one detail row.
+
+        Shared by the create and the take-over paths so an amended plan refreshes
+        exactly the fields a freshly created one would have written.
+
+        No bom_list: Batches Planned has no such field, so the assignment that
+        used to sit here never reached the database. The form reads its BOM back
+        through the parent plan's detail row instead.
+        """
+        return {
+            "batch_planning_id": row.batch_planning_id,
+            "slot_opening_id": row.slot_opening_id,
+            "project": frappe.db.get_value(
+                "Slot Opening", row.slot_opening_id, "project"
+            ) if row.slot_opening_id else None,
+            "employee_function": self.custom_employee_function,
+            "employee_name": self.custom_employee_headname,
+            "month": self.month,
+            "batch_type": row.batch_type,
+            "finished_item": row.finished_item,
+            "slot_booking_date": row.slot_booking_date,
+            "batch_planning": self.name,
+        }
+
     def create_batches_planned_records(self):
         count = 0
 
@@ -372,42 +424,31 @@ class BatchPlanning(Document):
             if existing:
                 if existing.batch_planning == self.name:
                     continue
-                elif existing.batch_planning:
+                if existing.batch_planning and not _is_superseded(
+                    existing.batch_planning
+                ):
                     frappe.throw(
                         f"⚠️ Batch Planning ID <b>{row.batch_planning_id}</b> "
                         f"already exists under <b>{existing.batch_planning}</b>."
                     )
-                else:
-                    frappe.db.set_value(
-                        "Batches Planned",
-                        existing.name,
-                        "batch_planning",
-                        self.name,
-                        update_modified=False,
-                    )
-                    continue
 
-            batch_key = f"{self.name}-{row.idx}"
-            bom_store = frappe.db.get_value(
-                "Batch BOM Store after Edit",
-                {"batch_id": batch_key},
-                "bom_name",
-            )
+                # Amending a cancelled plan: this batch already exists, so correct
+                # it in place rather than planning a second one for the same slot.
+                # No capacity change either - the slot was counted when the record
+                # was first created and cancelling never gave it back.
+                values = self._batches_planned_values(row)
+                values.update(_batches_planned_status(self.workflow_state))
+                frappe.db.set_value(
+                    "Batches Planned",
+                    existing.name,
+                    values,
+                    update_modified=False,
+                )
+                count += 1
+                continue
 
             bp = frappe.new_doc("Batches Planned")
-            bp.batch_planning_id = row.batch_planning_id
-            bp.slot_opening_id = row.slot_opening_id
-            if row.slot_opening_id:
-                bp.project = frappe.db.get_value("Slot Opening", row.slot_opening_id, "project")
-
-            bp.employee_function = self.custom_employee_function
-            bp.employee_name = self.custom_employee_headname
-            bp.month = self.month
-            bp.batch_type = row.batch_type
-            bp.finished_item = row.finished_item
-            bp.slot_booking_date = row.slot_booking_date
-            bp.batch_planning = self.name
-            bp.bom_list = bom_store if bom_store else row.bom_list
+            bp.update(self._batches_planned_values(row))
 
             bp.flags.ignore_permissions = True
             bp.flags.ignore_validate = True
@@ -420,16 +461,11 @@ class BatchPlanning(Document):
                 row.slot_opening_id, row.slot_booking_date, +1
             )
 
-            update_data = {
-                "workflow_state": getattr(row, 'status', None),
-            }
-            if getattr(row, 'status', None) == "Approved":
-                update_data["docstatus"] = 1
-            elif getattr(row, 'status', None) == "Cancelled":
-                update_data["docstatus"] = 2
-
             frappe.db.set_value(
-                "Batches Planned", bp.name, update_data, update_modified=False
+                "Batches Planned",
+                bp.name,
+                _batches_planned_status(self.workflow_state),
+                update_modified=False,
             )
             count += 1
 
@@ -631,6 +667,75 @@ def create_bulk_material_allocations(batch_planning_name):
         ma_data["warning"] = warning_message
     return ma_data
 
+def _is_superseded(batch_planning):
+    """True when this Batch Planning has been cancelled.
+
+    A cancelled plan keeps its rows and its Batches Planned on record, but it no
+    longer owns them: the plan amending it takes them over. Both uniqueness
+    guards consult this so an amendment is not mistaken for a duplicate.
+    """
+    if not batch_planning:
+        return False
+
+    return frappe.db.get_value("Batch Planning", batch_planning, "docstatus") == 2
+
+def _batches_planned_status(batch_planning_state):
+    """docstatus and workflow_state a Batches Planned inherits from its plan.
+
+    A batch is the same decision as the plan that created it, so it carries the
+    plan's state -- and batches are only ever created from an approved plan.
+
+    This used to read a per-row `status` instead. That field no longer exists on
+    Batch Planning Detail; only an orphan column survives, and nothing writes it
+    any more, so every row created since the field was dropped reported no status
+    and its batch was left sitting in Draft underneath an Approved plan. A blank
+    status also left the record with no workflow state at all, which is what made
+    it unopenable -- "Field workflow_state not found."
+    """
+    state = batch_planning_state or "Approved"
+
+    workflow_name = frappe.db.get_value(
+        "Workflow", {"document_type": "Batches Planned", "is_active": 1}, "name"
+    )
+    docstatus = frappe.db.get_value(
+        "Workflow Document State",
+        {"parent": workflow_name, "state": state},
+        "doc_status",
+    ) if workflow_name else None
+
+    if docstatus is None:
+        # The plan sits in a state the Batches Planned workflow does not define.
+        # Approved is the only state batches are ever created under, so use it
+        # rather than leaving the record without one.
+        state = "Approved"
+        docstatus = 1
+
+    values = {"workflow_state": state}
+    if int(docstatus):
+        values["docstatus"] = int(docstatus)
+
+    return values
+
+def get_default_workflow_state(doctype, docstatus):
+    """First state the active workflow defines for this docstatus, or None.
+
+    Mirrors what Workflow.update_default_workflow_status() backfills with, so a
+    record created here carries the same state it would have been given had it
+    gone through the workflow.
+    """
+    workflow_name = frappe.db.get_value(
+        "Workflow", {"document_type": doctype, "is_active": 1}, "name"
+    )
+    if not workflow_name:
+        return None
+
+    return frappe.db.get_value(
+        "Workflow Document State",
+        {"parent": workflow_name, "doc_status": str(docstatus)},
+        "state",
+        order_by="idx asc",
+    )
+
 @frappe.whitelist()
 def create_batches_planned(doc_name):
     """Called from a custom JS button on the Batch Planning form."""
@@ -660,6 +765,139 @@ def get_item_details_for_bom(item_codes):
         as_dict=True,
     )
 
+def get_bom_store_name(batch_key):
+    """Name of the edited-BOM store for one Batch Planning Detail row, if any.
+
+    Ordered by modified so the newest edit always wins. The table can hold more
+    than one row per key: the dialog used to insert client side, so a second save
+    that raced the first left a duplicate behind, and an unordered get_value would
+    hand back whichever the database happened to return first.
+    """
+    if not batch_key:
+        return None
+
+    names = frappe.get_all(
+        "Batch BOM Store after Edit",
+        filters={"batch_id": batch_key},
+        pluck="name",
+        order_by="modified desc",
+        limit=1,
+    )
+    return names[0] if names else None
+
+@frappe.whitelist()
+def get_batch_bom_store(batch_key):
+    """Edited BOM components for one row, or None when the row was never edited."""
+    name = get_bom_store_name(batch_key)
+    if not name:
+        return None
+
+    doc = frappe.get_doc("Batch BOM Store after Edit", name)
+    return {
+        "name": doc.name,
+        "bom_name": doc.bom_name,
+        "bom_components": [
+            {
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "uom": row.uom,
+                "qty": flt(row.qty),
+            }
+            for row in (doc.bom_components or [])
+        ],
+    }
+
+@frappe.whitelist()
+def save_batch_bom_store(batch_key, bom_name, components):
+    """Upsert the edited BOM for one Batch Planning Detail row.
+
+    Get-or-create lives here rather than in the dialog so two saves of the same
+    row can never land as two store documents - the dialog used to insert
+    whenever its lookup came back empty, which is how the duplicates already in
+    this table were made. Any such leftovers are collapsed on the next save.
+    """
+    if isinstance(components, str):
+        components = json.loads(components)
+
+    if not batch_key:
+        frappe.throw("Cannot store BOM edits without a batch key.")
+    if not components:
+        frappe.throw("BOM must have at least one item.")
+
+    names = frappe.get_all(
+        "Batch BOM Store after Edit",
+        filters={"batch_id": batch_key},
+        pluck="name",
+        order_by="modified desc",
+    )
+
+    for stale in names[1:]:
+        frappe.delete_doc(
+            "Batch BOM Store after Edit", stale, ignore_permissions=True, force=True
+        )
+
+    if names:
+        doc = frappe.get_doc("Batch BOM Store after Edit", names[0])
+    else:
+        doc = frappe.new_doc("Batch BOM Store after Edit")
+        doc.batch_id = batch_key
+
+    doc.bom_name = bom_name
+    doc.set("bom_components", [])
+    for item in components:
+        doc.append(
+            "bom_components",
+            {
+                "item_code": item.get("item_code"),
+                "item_name": item.get("item_name"),
+                "uom": item.get("uom"),
+                "qty": flt(item.get("qty")),
+            },
+        )
+
+    doc.save(ignore_permissions=True)
+    return doc.name
+
+@frappe.whitelist()
+def rekey_batch_bom_store(local_name, doc_name):
+    """Move BOM edits made before the first save onto the real document name.
+
+    Store rows are keyed `<batch planning>-<row idx>`, so a BOM edited while the
+    form was still local is filed under the throwaway `new-batch-planning-xxxx`
+    name. Nothing rewrote those keys - the old client filter looked for
+    `new-batch-creation-%`, a name Frappe never generates for this doctype - so
+    the edit was stranded and every later read fell back to the source BOM.
+    """
+    if not local_name or not doc_name or local_name == doc_name:
+        return 0
+
+    rows = frappe.get_all(
+        "Batch BOM Store after Edit",
+        filters={"batch_id": ["like", f"{local_name}-%"]},
+        fields=["name", "batch_id"],
+    )
+
+    moved = 0
+    for row in rows:
+        idx = row.batch_id[len(local_name) + 1 :]
+        if not idx.isdigit():
+            continue
+
+        new_key = f"{doc_name}-{idx}"
+        for clash in frappe.get_all(
+            "Batch BOM Store after Edit", filters={"batch_id": new_key}, pluck="name"
+        ):
+            frappe.delete_doc(
+                "Batch BOM Store after Edit", clash, ignore_permissions=True, force=True
+            )
+
+        frappe.db.set_value(
+            "Batch BOM Store after Edit", row.name, "batch_id", new_key
+        )
+        moved += 1
+
+    return moved
+
 @frappe.whitelist()
 def get_consolidated_bom_components(doc_name):
     doc = frappe.get_doc("Batch Planning", doc_name)
@@ -670,9 +908,7 @@ def get_consolidated_bom_components(doc_name):
             continue
         
         batch_key = f"{doc.name}-{row.idx}"
-        bom_store = frappe.db.get_value(
-            "Batch BOM Store after Edit", {"batch_id": batch_key}, "name"
-        )
+        bom_store = get_bom_store_name(batch_key)
         
         use_store = False
         items = []
@@ -1497,9 +1733,7 @@ def get_material_planning_data(doc_name):
             continue
         
         batch_key = f"{doc.name}-{row.idx}"
-        bom_store = frappe.db.get_value(
-            "Batch BOM Store after Edit", {"batch_id": batch_key}, "name"
-        )
+        bom_store = get_bom_store_name(batch_key)
         
         use_store = False
         components = []

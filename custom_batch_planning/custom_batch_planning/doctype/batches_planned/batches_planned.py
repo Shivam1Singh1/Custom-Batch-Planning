@@ -3,6 +3,10 @@ import frappe
 from frappe.model.document import Document
 from frappe.utils import flt, today
 
+from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
+    get_bom_store_name,
+)
+
 class BatchesPlanned(Document):
 
     def on_trash(self):
@@ -272,9 +276,7 @@ def get_bom_items_for_ma(batch_planning):
     items = []
 
     if matched.batch_type in ("Process Development", "Machine Trial"):
-        bom_store = frappe.db.get_value(
-            "Batch BOM Store after Edit", {"batch_id": batch_key}, "name"
-        )
+        bom_store = get_bom_store_name(batch_key)
         if bom_store:
             store_doc = frappe.get_doc("Batch BOM Store after Edit", bom_store)
             items = store_doc.bom_components or []

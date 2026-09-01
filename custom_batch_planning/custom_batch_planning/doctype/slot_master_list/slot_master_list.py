@@ -1,6 +1,7 @@
 import frappe
 from frappe.model.document import Document
-from frappe.utils import getdate, today, add_days, date_diff
+from frappe.model.naming import make_autoname
+from frappe.utils import getdate, today, add_days
 
 class SlotMasterList(Document):
 
@@ -15,29 +16,10 @@ class SlotMasterList(Document):
 
         prefix = f"SM-{yy}-{mm}-"
 
-        current = frappe.db.sql(
-            "SELECT `current` FROM `tabSeries` WHERE name = %s FOR UPDATE",
-            prefix
-        )
+        self.name = make_autoname(f"{prefix}.##")
 
-        next_num = int(current[0][0]) + 1 if current else 1
-
-        candidate = f"{prefix}{str(next_num).zfill(2)}"
-
-        while frappe.db.exists("Slot Master List", candidate):
-            next_num += 1
-            candidate = f"{prefix}{str(next_num).zfill(2)}"
-
-        frappe.db.sql(
-            """
-            INSERT INTO `tabSeries` (name, `current`)
-            VALUES (%s, %s)
-            ON DUPLICATE KEY UPDATE `current` = %s
-            """,
-            (prefix, next_num, next_num)
-        )
-
-        self.name = candidate
+        while frappe.db.exists("Slot Master List", self.name):
+            self.name = make_autoname(f"{prefix}.##")
 
     def before_save(self):
 
@@ -47,7 +29,7 @@ class SlotMasterList(Document):
             frappe.throw("Daily Batch Capacity must be a valid whole number.")
 
         if capacity < 1:
-            frappe.throw("Daily Batch Capacity must be greater than 1.")
+            frappe.throw("Daily Batch Capacity must be at least 1.")
 
         self.batch_capacity = capacity
 
@@ -148,6 +130,5 @@ def get_employee_function_projects(employee_function):
         "Project list",
         filters={"parent": employee_function},
         fields=["projects"],
-        ignore_permissions=True
     )
     return [r.projects for r in rows if r.projects]

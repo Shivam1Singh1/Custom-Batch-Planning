@@ -1,13 +1,6 @@
 frappe.ui.form.on('Slot Master List', {
 
     onload: function (frm) {
-        if (frm.is_new()) {
-            frm.set_value('naming_series', 'SM-.YY.-.MM.-.##');
-        }
-        if (!frm._realtime_bound) {
-            bind_realtime_capacity(frm);
-            frm._realtime_bound = true;
-        }
         set_project_filter(frm);
     },
 
@@ -44,11 +37,6 @@ frappe.ui.form.on('Slot Master List', {
                 });
                 frappe.model.set_value(frm.doctype, frm.docname, 'batch_capacity', '');
                 return;
-            } else {
-                let intVal = parseInt(val, 10);
-                if (intVal != val) {
-                    frappe.model.set_value(frm.doctype, frm.docname, 'batch_capacity', intVal);
-                }
             }
         }
         calculate_totals(frm);
@@ -80,26 +68,15 @@ frappe.ui.form.on('Slot Master List', {
                         frappe.new_doc('Slot Opening', {
                             employee_function: frm.doc.employee_function,
                             slot_master: frm.doc.name,
-                            batch_capacity: frm.doc.batch_capacity,
                             project: frm.doc.project
                         });
                     });
                 }
             });
-        } else if (frm.doc.batch_end_date && frm.doc.batch_end_date < today) {
-            frm.remove_custom_button('📋 Create Slot Opening');
-        }
-
-        if (!frm._realtime_bound) {
-            bind_realtime_capacity(frm);
-            frm._realtime_bound = true;
         }
     },
 
     before_save: function (frm) {
-        if (!frm.doc.naming_series) {
-            frm.set_value('naming_series', 'SM-.YY.-.MM.-.##');
-        }
         calculate_totals(frm);
     },
 
@@ -112,32 +89,10 @@ frappe.ui.form.on('Slot Master List', {
                 indicator: 'red'
             });
             frappe.validated = false;
-        } else {
-            let intVal = parseInt(val, 10);
-            if (intVal != val) {
-                frm.doc.batch_capacity = intVal;
-            }
         }
     }
 
 });
-
-function bind_realtime_capacity(frm) {
-    if (frm.fields_dict.batch_capacity && frm.fields_dict.batch_capacity.$input) {
-        frm.fields_dict.batch_capacity.$input
-            .off('input.realtime')
-            .on('input.realtime', function () {
-                let val = $(this).val();
-                let parsed = parseInt(val, 10);
-                if (Number.isInteger(Number(val)) && parsed >= 1) {
-                    frm.doc.batch_capacity = parsed;
-                } else {
-                    frm.doc.batch_capacity = 0;
-                }
-                calculate_totals(frm);
-            });
-    }
-}
 
 function calculate_totals(frm) {
     const start = frm.doc.batch_start_date;
@@ -165,7 +120,7 @@ function calculate_totals(frm) {
 
         const total_days = frappe.datetime.get_day_diff(end_date, start_date) + 1;
 
-        if (total_days < 0) {
+        if (total_days < 1) {
             frappe.msgprint({
                 title: __('Invalid Date Range'),
                 message: __('The End Date cannot be earlier than the Start Date.'),

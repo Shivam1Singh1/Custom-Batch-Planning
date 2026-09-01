@@ -2,50 +2,6 @@ frappe.ui.form.on("Batches Planned", {
 	refresh: function (frm) {
 		frm.page.clear_custom_actions();
 		render_bom_items(frm);
-
-		if (frm.doc.workflow_state === "Approved") {
-			frappe.db.get_value(
-				"Slot Opening",
-				frm.doc.slot_opening_id,
-				"batch_end_date",
-				function (data) {
-					let today = frappe.datetime.nowdate();
-					if (!data || !data.batch_end_date || data.batch_end_date < today) return;
-
-					frm.add_custom_button(
-						"Material Allocation",
-						function () {
-							frappe.call({
-								method: "frappe.client.get_list",
-								args: {
-									doctype: "Material Allocation",
-									filters: { batch_planning: frm.doc.batch_planning },
-									fields: ["name", "allocation_status"],
-									order_by: "creation desc",
-								},
-								callback: function (r) {
-									let existing = r.message || [];
-									let active = existing.filter(
-										(d) => d.allocation_status !== "Deallocated",
-									);
-									if (active.length > 0) {
-										frappe.confirm(
-											`Materials already allocated via <b>${active.map((d) => d.name).join(", ")}</b>.<br><br>Do you still want to create a new Material Allocation?`,
-											function () {
-												open_new_ma(frm);
-											},
-										);
-									} else {
-										open_new_ma(frm);
-									}
-								},
-							});
-						},
-						"Create",
-					);
-				},
-			);
-		}
 	},
 });
 
@@ -76,40 +32,20 @@ function render_bom_items(frm) {
 			}
 
 			let batch_key = `${frm.doc.batch_planning}-${matched.idx}`;
+			// Server side so the newest store row wins; the table can carry more than
+			// one row per key from the days the dialog inserted client side.
 			frappe.call({
-				method: "frappe.client.get_list",
-				args: {
-					doctype: "Batch BOM Store after Edit",
-					filters: { batch_id: batch_key },
-					fields: ["name"],
-					limit: 1,
-				},
+				method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_batch_bom_store",
+				args: { batch_key: batch_key },
 				callback: function (store) {
-					if (store.message && store.message.length > 0) {
-						frappe.call({
-							method: "frappe.client.get",
-							args: {
-								doctype: "Batch BOM Store after Edit",
-								name: store.message[0].name,
-							},
-							callback: function (res) {
-								let items = (res.message.bom_components || []).map(function (row) {
-									return {
-										item_code: row.item_code,
-										item_name: row.item_name,
-										uom: row.uom,
-										qty: row.qty,
-									};
-								});
-								render_bom_table_html(
-									frm,
-									items,
-									matched.bom_list,
-									frm.doc.finished_item,
-									true,
-								);
-							},
-						});
+					if (store.message && (store.message.bom_components || []).length) {
+						render_bom_table_html(
+							frm,
+							store.message.bom_components,
+							matched.bom_list,
+							frm.doc.finished_item,
+							true,
+						);
 					} else {
 						frappe.call({
 							method: "frappe.client.get",
@@ -228,14 +164,4 @@ function find_matched_row(rows, batch_planning_id, amended_from) {
 
 function empty_state(icon, msg) {
 	return `<div style="padding:48px; text-align:center; color:#6b7280; border:2px dashed #d1fae5; border-radius:12px; background:#f0fdf4;"><div style="font-size:36px;">${icon}</div><div style="font-size:13px;">${msg}</div></div>`;
-}
-
-function open_new_ma(frm) {
-	frappe.new_doc("Material Allocation", {
-		batch_planning: frm.doc.batch_planning,
-		employee_function: frm.doc.employee_function,
-		project_id: frm.doc.project,
-		project_name: frm.doc.project_name,
-		workflow_state: "Draft",
-	});
 }
