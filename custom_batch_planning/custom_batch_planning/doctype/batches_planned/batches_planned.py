@@ -92,7 +92,7 @@ def get_material_planning_data(items, warehouse, batch_planning, employee_functi
                 -- (docstatus 0, NULL status) reserve stock here while Batch
                 -- Planning said it did not, so the same item read differently on
                 -- two screens.
-                AND ma.allocation_status = 'Allocated'
+                AND ma.allocation_status IN ('Allocated', 'Material Request Done')
                 AND ma.docstatus != 2
             """, (item_code, employee_function))[0][0] or 0
         )
@@ -318,7 +318,7 @@ def get_bom_items_for_ma(batch_planning):
             WHERE mai.item_code = %s AND ma.employee_function = %s
             -- See the note on the other allocated_qty query above: only
             -- "Allocated" holds stock.
-            AND ma.allocation_status = 'Allocated'
+            AND ma.allocation_status IN ('Allocated', 'Material Request Done')
             AND ma.docstatus != 2
         """,
                 (item_code, bp.employee_function),

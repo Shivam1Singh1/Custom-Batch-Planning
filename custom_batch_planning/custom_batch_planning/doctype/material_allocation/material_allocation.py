@@ -948,7 +948,7 @@ class MaterialAllocation(Document):
                     INNER JOIN `tabMaterial Allocation` ma ON ma.name = mbd.parent
                     WHERE mbd.batch_no = sle.batch_no
                       AND ma.name != %s
-                      AND ma.allocation_status = 'Allocated'
+                      AND ma.allocation_status IN ('Allocated', 'Material Request Done')
                       AND ma.docstatus != 2
                 ), 0)) AS actual_qty
             FROM `tabStock Ledger Entry` sle
@@ -967,7 +967,7 @@ class MaterialAllocation(Document):
                 INNER JOIN `tabMaterial Allocation` ma ON ma.name = mbd.parent
                 WHERE mbd.batch_no = sle.batch_no
                   AND ma.name != %s
-                  AND ma.allocation_status = 'Allocated'
+                  AND ma.allocation_status IN ('Allocated', 'Material Request Done')
                   AND ma.docstatus != 2
             ), 0)) > 0
             ORDER BY b.expiry_date ASC
@@ -1198,7 +1198,11 @@ def on_stock_entry_submit(stock_entry_name):
 
     ma_doc = frappe.get_doc("Material Allocation", ma_name)
 
-    if ma_doc.allocation_status != "Allocated":
+    # Both pre-transfer statuses are valid starting points. An allocation whose
+    # request has been raised sits at "Material Request Done", and that is the
+    # normal path into a Stock Entry — refusing it here would leave the
+    # allocation stuck holding stock forever after the transfer had happened.
+    if ma_doc.allocation_status not in ("Allocated", "Material Request Done"):
         return
 
     # Resolved through the Material Request on a first transfer, so record the
@@ -1234,7 +1238,8 @@ def get_allocated_items(batch_planning, employee_function):
     WHAT COUNTS: approved allocations that actually allocated something.
 
         workflow_state  = 'Approved'                     — no drafts
-        allocation_status IN ('Allocated', 'Stock Entry Done')
+        allocation_status IN ('Allocated', 'Material Request Done',
+                              'Stock Entry Done')
         docstatus      <> 2                              — no cancellations
 
     Deallocated is excluded by that IN list: it was released deliberately and
@@ -1257,7 +1262,7 @@ def get_allocated_items(batch_planning, employee_function):
           AND ma.employee_function = %(ef)s
           AND ma.docstatus <> 2
           AND ma.workflow_state = 'Approved'
-          AND IFNULL(ma.allocation_status, '') IN ('Allocated', 'Stock Entry Done')
+          AND IFNULL(ma.allocation_status, '') IN ('Allocated', 'Material Request Done', 'Stock Entry Done')
           AND mai.allocate_qty > 0
     """
 

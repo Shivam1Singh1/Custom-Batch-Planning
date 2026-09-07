@@ -1560,7 +1560,13 @@ _POOL_COLUMN = "COALESCE(NULLIF(mai.source_pool, ''), 'Tagged')"
 # free: the first released the stock, the second consumed it into a transfer, and
 # neither is "Allocated" any more.
 #
-# get_batches has always gated on exactly this value for its batch-level
+# BOTH pre-transfer statuses count. "Material Request Done" is Allocated with a
+# transfer request raised against it: the stock has not moved, so the reservation
+# is every bit as live. Leaving it out would have released the stock the moment
+# somebody raised the request — Free Qty would rise while the material was more
+# committed than before, not less.
+#
+# get_batches has always gated on this same set for its batch-level
 # double-reservation guard, so this brings the quantity figures in line with it.
 #
 # DELIBERATELY NOT USED BY THE BOM CAP. check_batch_planning_allocation_limit and
@@ -1568,7 +1574,9 @@ _POOL_COLUMN = "COALESCE(NULLIF(mai.source_pool, ''), 'Tagged')"
 # thing: total allocated per item may not exceed Qty Required, and two drafts
 # that together breach it should be caught while they are still drafts rather
 # than at the second Allocate click.
-_HOLDS_STOCK = "ma.allocation_status = 'Allocated'"
+_HOLDS_STOCK = (
+    "ma.allocation_status IN ('Allocated', 'Material Request Done')"
+)
 
 
 

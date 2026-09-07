@@ -401,7 +401,15 @@ frappe.ui.form.on("Material Allocation", {
                         function () { window.auto_allocate_all(frm); }
                     ).addClass("btn-primary");
 
-                } else if (frm.doc.allocation_status === "Allocated") {
+                } else if (["Allocated", "Material Request Done"]
+                               .indexOf(frm.doc.allocation_status) > -1) {
+                    // Both pre-transfer states land here. The branch already
+                    // decides what to show by looking up the live Material
+                    // Request, so it handles either state without further
+                    // splitting: with a request it offers Open Material Request,
+                    // without one it offers Raise Material Request and
+                    // Deallocate. Keying on "Allocated" alone left the toolbar
+                    // empty the moment a request was saved.
 
                     // The Stock Entry is no longer raised from here - it is
                     // made from the Material Request using ERPNext's own
