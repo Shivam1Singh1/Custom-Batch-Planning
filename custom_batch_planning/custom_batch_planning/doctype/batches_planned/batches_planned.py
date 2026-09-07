@@ -87,7 +87,12 @@ def get_material_planning_data(items, warehouse, batch_planning, employee_functi
                 INNER JOIN `tabMaterial Allocation` ma ON ma.name = mai.parent
                 WHERE mai.item_code = %s
                 AND ma.employee_function = %s
-                AND ma.allocation_status NOT IN ('Deallocated', 'Stock Entry Done')
+                -- Only "Allocated" holds stock. Matches _HOLDS_STOCK in
+                -- batch_planning.py; the old negative filter let a saved draft
+                -- (docstatus 0, NULL status) reserve stock here while Batch
+                -- Planning said it did not, so the same item read differently on
+                -- two screens.
+                AND ma.allocation_status = 'Allocated'
                 AND ma.docstatus != 2
             """, (item_code, employee_function))[0][0] or 0
         )
@@ -311,7 +316,9 @@ def get_bom_items_for_ma(batch_planning):
             FROM `tabMaterial Allocation Item` mai
             JOIN `tabMaterial Allocation` ma ON ma.name = mai.parent
             WHERE mai.item_code = %s AND ma.employee_function = %s
-            AND ma.allocation_status NOT IN ('Deallocated', 'Stock Entry Done')
+            -- See the note on the other allocated_qty query above: only
+            -- "Allocated" holds stock.
+            AND ma.allocation_status = 'Allocated'
             AND ma.docstatus != 2
         """,
                 (item_code, bp.employee_function),

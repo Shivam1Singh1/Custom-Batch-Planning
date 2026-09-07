@@ -558,10 +558,17 @@ def create_bulk_material_allocations(batch_planning_name):
     shared_rows = []
     shared_total = 0.0
     lab_covered = []
+    already_covered = []
+
+    # What this plan has already reserved, whichever flow reserved it. See
+    # _bp_allocated_by_item: the BOM requirement is shared, so an untagged
+    # allocation consumes this builder's headroom just as a tagged one does.
+    already = _bp_allocated_by_item(batch_planning_name)
 
     for item in consolidated_items:
         item_code = item["item_code"]
         qty_required = flt(item["qty"])
+        allocated_already = already.get(item_code, 0.0)
 
         # Lab Wise stock is material this batch ALREADY HOLDS — issued out of the
         # store under its own tag. Allocating against the gross BOM quantity
@@ -581,9 +588,16 @@ def create_bulk_material_allocations(batch_planning_name):
             "BP",
             in_main=False,
         )
-        outstanding = max(qty_required - lab_stock, 0.0)
+        outstanding = max(qty_required - lab_stock - allocated_already, 0.0)
         if outstanding <= 0:
-            lab_covered.append(item_code)
+            # Two different reasons for the same skip, reported apart because
+            # they mean opposite things to whoever reads the note: one says the
+            # batch already holds the material, the other says the paperwork is
+            # already done.
+            if allocated_already > 0:
+                already_covered.append(item_code)
+            else:
+                lab_covered.append(item_code)
             continue
 
         figures = free_stock_figures(
@@ -642,18 +656,32 @@ def create_bulk_material_allocations(batch_planning_name):
             "global_allocated_qty": round(from_shared, 2),
             "stock_available": round(cap, 2),
         }
+        held_notes = []
         if lab_stock > 0:
+            held_notes.append(f"{round(lab_stock, 2)} {item['uom']} held in lab stock")
+        if allocated_already > 0:
+            held_notes.append(
+                f"{round(allocated_already, 2)} {item['uom']} already allocated on this plan"
+            )
+        if held_notes:
             row["reason"] = (
-                f"{round(lab_stock, 2)} {item['uom']} already held in lab stock; "
-                f"allocating the {round(allocate_qty, 2)} shortfall only."
+                "; ".join(held_notes)
+                + f"; allocating the {round(allocate_qty, 2)} shortfall only."
             )
         ma_data["material_allocation"].append(row)
 
     if not ma_data["material_allocation"]:
-        if lab_covered:
+        if already_covered and not lab_covered:
             frappe.throw(
                 "Nothing to allocate — every item on this Batch Planning is already "
-                "covered by stock this batch holds in the lab."
+                "fully allocated. Deallocate an existing Material Allocation first "
+                "if you need to reissue it."
+            )
+        if lab_covered or already_covered:
+            frappe.throw(
+                "Nothing to allocate — every item on this Batch Planning is already "
+                "covered, either by stock this batch holds in the lab or by an "
+                "existing allocation."
             )
         frappe.throw(
             "No free stock is available for any item on this Batch Planning — "
@@ -666,6 +694,53 @@ def create_bulk_material_allocations(batch_planning_name):
     if warning_message:
         ma_data["warning"] = warning_message
     return ma_data
+
+def _bp_allocated_by_item(batch_planning, exclude_parent=None):
+    """Qty already reserved on this plan, per item, across BOTH pools.
+
+    This is the ceiling check_batch_planning_allocation_limit enforces at save —
+    total allocated per item across every live allocation on the plan may not
+    exceed quantity_required — read here so a builder never PROPOSES a quantity
+    that is guaranteed to be rejected. The two must stay in step: same status
+    filters, same docstatus filter, same sum over allocate_qty. If this reads
+    less than the check does, the draft fails on save; if it reads more, the
+    builder silently under-allocates.
+
+    DELIBERATELY POOL-BLIND, and that is the whole point. Tagged and untagged
+    allocations draw on different stock, but they satisfy the SAME BOM
+    requirement — 50 units needed is 50 units needed however they are sourced.
+    A plan that reserved 50 from the tagged pool has nothing left to reserve
+    from the untagged one, and offering it again produced exactly the confusion
+    this fixes: an item showing as fully allocated in the Allocated Items dialog
+    while a fresh draft proposed its full quantity over again.
+
+    One grouped query rather than one per item: a fifty-row plan would otherwise
+    pay fifty round trips before the builder has done any work.
+
+    COUNTS DRAFTS, unlike the free-stock figures. This is the BOM ceiling, not a
+    stock reservation: two drafts that together exceed Qty Required should be
+    caught while they are still drafts, and the untagged builder must not
+    re-offer an item an unallocated draft already covers. See _HOLDS_STOCK for
+    the narrower gate the pool queries use and why the two differ.
+    """
+    exclude_sql = "AND ma.name <> %(exclude)s" if exclude_parent else ""
+    rows = frappe.db.sql(
+        f"""
+        SELECT mai.item_code AS item_code,
+               IFNULL(SUM(mai.allocate_qty), 0) AS qty
+        FROM `tabMaterial Allocation Item` mai
+        INNER JOIN `tabMaterial Allocation` ma ON ma.name = mai.parent
+        WHERE ma.batch_planning = %(bp)s
+          {exclude_sql}
+          AND ma.docstatus <> 2
+          AND ma.allocation_status NOT IN ('Deallocated', 'Stock Entry Done')
+        GROUP BY mai.item_code
+        """,
+        {"bp": batch_planning, "exclude": exclude_parent},
+        as_dict=True,
+    )
+    return {r.item_code: flt(r.qty) for r in rows}
+
 
 def _is_superseded(batch_planning):
     """True when this Batch Planning has been cancelled.
@@ -899,7 +974,31 @@ def rekey_batch_bom_store(local_name, doc_name):
     return moved
 
 @frappe.whitelist()
-def get_consolidated_bom_components(doc_name):
+def get_consolidated_bom_components(doc_name, scale="per_unit"):
+    """Consolidated raw-material demand across every batch row on this plan.
+
+    scale picks WHICH BOM quantity is summed, and the two differ by the BOM's
+    own output quantity (ERPNext sets qty_consumed_per_unit = stock_qty /
+    BOM.quantity — see bom.py):
+
+        "per_unit"  qty_consumed_per_unit — demand for ONE unit of the finished
+                    item. The historical default, kept so the Material Planning
+                    and BOM Component tabs are untouched by this parameter.
+
+        "stock"     stock_qty — demand for a full BOM's output, which is what a
+                    batch actually produces. Used by the Untagged Materials tab.
+
+    THE TWO TABS THEREFORE DISAGREE on any BOM whose quantity is not 1, and on
+    this site that is not hypothetical: of 12 submitted BOMs, one is quantity
+    400 and one is 20, so the same item reads 400x apart between the tabs. That
+    divergence is deliberate and was signed off — "stock" is the correct scale
+    and the new tab uses it from day one — but the older tabs have NOT been
+    migrated, and doing so is a separate decision.
+
+    The edited-BOM path is unaffected by scale: Batch BOM Store after Edit rows
+    were captured from the dialog, which has always read stock_qty, so they are
+    already on the "stock" scale whichever way this is called.
+    """
     doc = frappe.get_doc("Batch Planning", doc_name)
     components = {}
 
@@ -921,11 +1020,12 @@ def get_consolidated_bom_components(doc_name):
             items = bom.exploded_items or bom.items or []
             
         for item in items:
-            qty = flt(
-                item.qty
-                if use_store
-                else (item.qty_consumed_per_unit or item.stock_qty or item.qty)
-            )
+            if use_store:
+                qty = flt(item.qty)
+            elif scale == "stock":
+                qty = flt(item.stock_qty or item.qty)
+            else:
+                qty = flt(item.qty_consumed_per_unit or item.stock_qty or item.qty)
             uom = item.uom if use_store else (item.stock_uom or item.uom)
             item_code = item.item_code
             item_name = item.item_name
@@ -967,8 +1067,53 @@ PO_PROJECT = "COALESCE(NULLIF(poi.project,''), NULLIF(po.project,''))"
 PR_EF = "COALESCE(NULLIF(pri.employee_function,''), NULLIF(pr.employee_function,''))"
 PR_PROJECT = "COALESCE(NULLIF(pri.project,''), NULLIF(pr.project,''))"
 
+# Every place a batch tag can live on a pipeline row, coalesced the same way
+# EF and Project already are above.
+#
+# It is not one field. A document can carry the tag on the ITEM
+# (batch_planning_id, or the older custom_batch_planning_no) or on the PARENT
+# (custom_batch_planning_no, or custom_batch_planning) — four fields for MR and
+# PO, three for PR, which has no item-level custom field.
+#
+# Checking only the item's batch_planning_id, as the untagged columns first did,
+# calls a document untagged when its parent plainly names a Batch Planning. On
+# this site that mislabels 58 Material Request lines whose parent is tagged, 68
+# more carrying only the item-level custom field, and one row each on PO and PR
+# — PR-2026-2027-00002 among them, whose header reads BP-26-11-001 while its
+# single item row has no batch_planning_id at all.
+MR_BP = (
+    "COALESCE(NULLIF(mri.batch_planning_id,''), NULLIF(mri.custom_batch_planning_no,''), "
+    "NULLIF(mr.custom_batch_planning_no,''), NULLIF(mr.custom_batch_planning,''))"
+)
+PO_BP = (
+    "COALESCE(NULLIF(poi.batch_planning_id,''), NULLIF(poi.custom_batch_planning_no,''), "
+    "NULLIF(po.custom_batch_planning_no,''), NULLIF(po.custom_batch_planning,''))"
+)
+PR_BP = (
+    "COALESCE(NULLIF(pri.batch_planning_id,''), "
+    "NULLIF(pr.custom_batch_planning_no,''), NULLIF(pr.custom_batch_planning,''))"
+)
 
-def _bp_predicate(alias, mode):
+
+def _project_clause(project_expr, project):
+    """The Project filter, or nothing at all when there is no project to filter on.
+
+    Every tagged column scopes to one Project, and must keep doing so. The
+    untagged columns cannot: a row with no batch tag almost never carries a
+    Project either, and `<expr> = %(project)s` is never true for NULL — so
+    keeping the clause would silently return 0 for exactly the legacy rows the
+    Untagged Materials tab exists to surface.
+
+    Dropping the clause is safe there because Employee Function still scopes the
+    query, through the store warehouse for stock and through the EF columns for
+    the pipeline. It is NOT safe anywhere else, which is why this returns the
+    full clause whenever a project is supplied — every existing caller passes
+    one and is unaffected.
+    """
+    return f"AND {project_expr} = %(project)s" if project else ""
+
+
+def _bp_predicate(alias, mode, bp_expr=None):
     """Row filter for the two figures stacked in every open-pipeline cell.
 
     The two modes select DISJOINT sets of rows — GEN is other batches' demand,
@@ -993,6 +1138,24 @@ def _bp_predicate(alias, mode):
     take an untagged_in_gen escape hatch that swept untagged receipts into GEN,
     and it was removed so one classification governs all of them.
     """
+    if mode == "UNTAGGED":
+        # The third pool, and the complement of GEN + BP: rows carrying no batch
+        # tag at all. It is what the Untagged Materials tab is built on — stock
+        # and pipeline raised before batch planning existed, which every other
+        # column in this file deliberately ignores.
+        #
+        # bp_expr is the full set of places a tag can live for this doctype (see
+        # MR_BP / PO_BP / PR_BP). Pass it for anything with a parent document: a
+        # row whose header names a Batch Planning is NOT untagged, however empty
+        # its own batch_planning_id happens to be. Stock Ledger Entry has no
+        # parent and only the one column, so it falls back to the default.
+        #
+        # Takes no %(bp)s parameter because there is no batch to compare against.
+        # Callers still pass one in the params dict and that is harmless: an
+        # unused key is ignored, and keeping the signature uniform is what lets
+        # _open_mr / _open_po / _open_pr_grn serve all three modes unchanged.
+        expr = bp_expr or f"NULLIF({alias}.batch_planning_id, '')"
+        return f"({expr}) IS NULL"
     if mode == "GEN":
         return (
             f"({alias}.batch_planning_id IS NOT NULL "
@@ -1055,8 +1218,8 @@ def _open_mr(item_code, ef, project, bp, mode):
           AND {MR_APPROVED}
           AND {MR_PURCHASE_ONLY}
           AND {MR_EF} = %(ef)s
-          AND {MR_PROJECT} = %(project)s
-          AND {_bp_predicate('mri', mode)}
+          {_project_clause(MR_PROJECT, project)}
+          AND {_bp_predicate('mri', mode, MR_BP)}
         """,
         {"item_code": item_code, "ef": ef, "project": project, "bp": bp},
         as_dict=True,
@@ -1111,8 +1274,8 @@ def _open_po(item_code, ef, project, bp, mode):
         WHERE poi.item_code = %(item_code)s
           AND {PO_APPROVED}
           AND {PO_EF} = %(ef)s
-          AND {PO_PROJECT} = %(project)s
-          AND {_bp_predicate('poi', mode)}
+          {_project_clause(PO_PROJECT, project)}
+          AND {_bp_predicate('poi', mode, PO_BP)}
         """,
         {"item_code": item_code, "ef": ef, "project": project, "bp": bp},
         as_dict=True,
@@ -1156,8 +1319,8 @@ def _open_pr_grn(item_code, ef, project, bp, mode):
         WHERE pri.item_code = %(item_code)s
           AND {PR_UNAPPROVED}
           AND {PR_EF} = %(ef)s
-          AND {PR_PROJECT} = %(project)s
-          AND {_bp_predicate('pri', mode)}
+          {_project_clause(PR_PROJECT, project)}
+          AND {_bp_predicate('pri', mode, PR_BP)}
         """,
         {"item_code": item_code, "ef": ef, "project": project, "bp": bp},
         as_dict=True,
@@ -1167,7 +1330,16 @@ def _open_pr_grn(item_code, ef, project, bp, mode):
 
 
 
-def _stock_qty(item_code, warehouse, project, bp, mode, in_main=True):
+def _ef_lab_warehouses(ef_doc):
+    """The lab warehouses an Employee Function declares, from table_szrn.
+
+    Read the same way get_employee_function_defaults reads it, so the report and
+    the Material Request builder agree on what counts as this function's lab.
+    """
+    return [r.lab_warehouse for r in (ef_doc.table_szrn or []) if r.lab_warehouse]
+
+
+def _stock_qty(item_code, warehouse, project, bp, mode, in_main=True, warehouses=None):
     """Stock Ledger qty for one item, split by batch tag.
 
     Reuses _bp_predicate so "GEN" means here exactly what it means for the open
@@ -1183,23 +1355,55 @@ def _stock_qty(item_code, warehouse, project, bp, mode, in_main=True):
     this report has always used.
 
     in_main=False flips to everything OUTSIDE the main store, which is how Lab
-    Wise is measured.
+    Wise is measured FOR THE TAGGED MODES ONLY.
+
+    WHY THE NEGATIVE SCOPE IS TAGGED-ONLY. `warehouse <> main` does not really
+    scope anything; it only splits an already-scoped set. Under GEN and BP the
+    scoping is done by the batch tag, which confines rows to one batch's own
+    movements, so "everywhere except the store" means "this batch's labs" in
+    practice. Under UNTAGGED there is no tag doing that work, and the same
+    clause silently matches EVERY warehouse in the company — other Employee
+    Functions' main stores included.
+
+    It shipped that way and overstated untagged Lab Wise by roughly twenty
+    times: CN02010004 on VP-LTP-MFG-001 read 130,500, of which only 6,300 was
+    in that function's own labs; the other 124,200 belonged to other functions,
+    93,000 of it sitting in another function's STORE. Total Stock was then
+    provably Employee-Function-independent — the same 175,500 whichever
+    function you viewed, because it was simply all untagged stock everywhere.
+
+    Pass `warehouses` to scope POSITIVELY instead: a list of warehouses the row
+    must be in, which is what the untagged path now uses (the Employee
+    Function's declared lab warehouses, see _ef_lab_warehouses). It overrides
+    in_main entirely. This is the shape any new pool should use — a filter that
+    only constrains when some other predicate is already doing the real work is
+    the same trap _project_clause exists to document.
     """
-    wh_op = "=" if in_main else "<>"
+    if warehouses is not None:
+        # An empty list must not become `IN ()`, which is a syntax error. An
+        # Employee Function that declares no lab warehouses holds no lab stock,
+        # so 0 is also the right answer.
+        if not warehouses:
+            return 0.0
+        wh_clause = "AND sle.warehouse IN %(warehouses)s"
+    else:
+        wh_clause = f"AND sle.warehouse {'=' if in_main else '<>'} %(warehouse)s"
+
     return flt(
         frappe.db.sql(
             f"""
         SELECT IFNULL(SUM(sle.actual_qty), 0)
         FROM `tabStock Ledger Entry` sle
         WHERE sle.item_code = %(item_code)s
-          AND sle.warehouse {wh_op} %(warehouse)s
-          AND sle.project = %(project)s
+          {wh_clause}
+          {_project_clause('sle.project', project)}
           AND sle.is_cancelled = 0
           AND {_bp_predicate('sle', mode)}
         """,
             {
                 "item_code": item_code,
                 "warehouse": warehouse,
+                "warehouses": tuple(warehouses) if warehouses else None,
                 "project": project,
                 "bp": bp,
             },
@@ -1328,6 +1532,45 @@ _SOURCE_COLUMN = {
               "ELSE 0 END",
 }
 
+# Which pool a reservation drew on. Tagged rows and untagged rows describe
+# claims against DIFFERENT physical piles, so no figure may ever mix them: an
+# untagged allocation that counted as a tagged reservation would shrink the
+# Material Planning tab's free stock by units that pile never held.
+#
+# Rows written before this field existed are all tagged-flow rows — the untagged
+# flow did not exist to write any — so an empty value reads as "Tagged". That is
+# what makes the column safe to add with no backfill, unlike the local/global
+# split, whose absence is genuinely ambiguous (see
+# patches/backfill_allocation_source_split.py).
+_POOL_COLUMN = "COALESCE(NULLIF(mai.source_pool, ''), 'Tagged')"
+
+# Which allocations actually hold stock.
+#
+# "Allocated" is a POSITIVE gate, and it replaced the negative one — status NOT
+# IN ('Deallocated', 'Stock Entry Done') — which had a hole in it. A freshly
+# saved draft has docstatus 0 and a NULL allocation_status, so it passed both
+# halves of that filter and consumed free stock the moment someone pressed Save:
+# before approval, and before anyone clicked Allocate. Free Qty dropped for a
+# document that had committed to nothing.
+#
+# The gate now matches where the commitment is actually made. auto_allocate sets
+# allocation_status = "Allocated", and it refuses to run unless the workflow has
+# reached Approved — so nothing reserves stock until the Allocate button has been
+# pressed on an approved document. Deallocated and Stock-Entry-Done fall out for
+# free: the first released the stock, the second consumed it into a transfer, and
+# neither is "Allocated" any more.
+#
+# get_batches has always gated on exactly this value for its batch-level
+# double-reservation guard, so this brings the quantity figures in line with it.
+#
+# DELIBERATELY NOT USED BY THE BOM CAP. check_batch_planning_allocation_limit and
+# _bp_allocated_by_item keep counting drafts, because they protect a different
+# thing: total allocated per item may not exceed Qty Required, and two drafts
+# that together breach it should be caught while they are still drafts rather
+# than at the second Allocate click.
+_HOLDS_STOCK = "ma.allocation_status = 'Allocated'"
+
+
 
 def _allocated_qty(
     item_code,
@@ -1338,6 +1581,7 @@ def _allocated_qty(
     exclude_parent=None,
     for_update=False,
     source=None,
+    pool="Tagged",
 ):
     """Qty reserved through Material Allocation, at batch scope or pool scope.
 
@@ -1352,13 +1596,22 @@ def _allocated_qty(
     stock, "global" only what came out of the shared pool. See _SOURCE_COLUMN
     above for how rows predating the breakdown are handled.
 
+    pool is a different axis and both must be set correctly. source splits a
+    reservation across the two TAGGED piles; pool decides whether the row is
+    counted against the tagged piles at all. It defaults to "Tagged" so every
+    existing caller keeps measuring exactly what it always did — the untagged
+    pool is opt-in, and _untagged_allocated_qty is the only thing that asks for
+    it. Passing pool=None to total both would be meaningless: the two piles are
+    disjoint stock under disjoint accounting, and no column displays their sum.
+
     Scoped on ma.project_id, not ma.project: project_id is the populated field
     on this doctype (set on 23 of 25 allocations; ma.project is empty on all of
     them).
 
-    A Deallocated or Stock-Entry-Done allocation no longer holds stock — the
-    first released it, the second consumed it into a Stock Entry — so neither
-    counts as a live reservation.
+    Only allocations in status "Allocated" count as live reservations — see
+    _HOLDS_STOCK. A draft reserves nothing, and neither does an approved document
+    nobody has pressed Allocate on; a Deallocated one released its stock and a
+    Stock-Entry-Done one consumed it into a transfer.
 
     exclude_parent drops one Material Allocation from the total. It exists for
     the save-time re-check: a document being re-saved is already in the table,
@@ -1392,7 +1645,8 @@ def _allocated_qty(
           {scope_sql}
           {exclude_sql}
           {exclude_bp_sql}
-          AND ma.allocation_status NOT IN ('Deallocated', 'Stock Entry Done')
+          AND {_POOL_COLUMN} = %(pool)s
+          AND {_HOLDS_STOCK}
           AND ma.docstatus != 2
         {lock_sql}
         """,
@@ -1402,6 +1656,7 @@ def _allocated_qty(
                 "scope": scope,
                 "exclude": exclude_parent,
                 "exclude_bp": exclude_batch_planning,
+                "pool": pool,
             },
         )[0][0]
         or 0.0
@@ -1462,6 +1717,104 @@ def split_local_first(quantities, local_free, global_free):
         "requested": requested_total,
         "shortfall": round(max(requested_total - capacity, 0.0), 6),
         "rows": rows,
+    }
+
+
+def split_lab_first(quantities, lab_free, main_free):
+    """Split untagged draws across the two untagged piles, LAB FIRST.
+
+    A rename of split_local_first, not a second implementation - same clamping,
+    same shared-pool draining across several rows of one item, and the same rule
+    that `rows` still sums to the full request when `shortfall` is non-zero, so
+    the caller must reject on shortfall rather than trust the rows.
+
+    The rename earns its place because the priority means something completely
+    different on each axis, and reading "local" as "lab" is exactly the mistake
+    that would go unnoticed. On the tagged axis local-first is about OWNERSHIP:
+    spend your own batch's stock before borrowing another batch's. Here it is
+    about LOCATION, and about what an allocation costs downstream. Lab stock is
+    already standing where the batch needs it, so consuming it first reserves
+    the units that require no transfer at all; only the remainder falls to the
+    store, where it becomes a physical Main -> Lab movement someone has to make.
+
+    Allocating main-first would reserve store units while lab units sat idle,
+    manufacturing transfer work out of nothing.
+    """
+    split = split_local_first(quantities, lab_free, main_free)
+    return {
+        "lab_free": split["local_free"],
+        "main_free": split["global_free"],
+        "capacity": split["capacity"],
+        "requested": split["requested"],
+        "shortfall": split["shortfall"],
+        "rows": [
+            {"from_lab": r["from_local"], "from_main": r["from_global"]}
+            for r in split["rows"]
+        ],
+    }
+
+
+def untagged_free_figures(
+    item_code,
+    warehouse,
+    lab_warehouses,
+    employee_function,
+    batch_planning,
+    exclude_parent=None,
+    for_update=False,
+):
+    """The untagged pool's two halves, each net of what has been drawn from it.
+
+    The untagged counterpart of free_stock_figures, and deliberately much
+    smaller: there is one pile here, not two competing ones, so there is no
+    cross-batch lending to settle and no local/global mirror to keep consistent.
+
+        lab_free  = untagged stock in this function's labs  - lab-sourced draws
+        main_free = untagged stock in its store             - main-sourced draws
+
+    EACH DRAW IS CHARGED TO THE HALF IT CAME FROM, which is only possible
+    because every untagged row records lab_allocated_qty and main_allocated_qty
+    separately. Charging both to one half would let the other keep offering
+    units that are already reserved - the same failure free_pools exists to
+    prevent on the tagged axis.
+
+    Summed, the two halves equal the report's Free Qty exactly:
+    (main + lab) - total untagged allocated. That identity is the point; the
+    allocator and the tab must not be able to disagree about how much is free.
+
+    Scoped by Employee Function and NOT by project, matching
+    get_untagged_material_data and _untagged_allocated_qty. See the note there:
+    untagged rows almost never carry a Project, so a project filter would
+    measure the reservations against a pool that was counted without one.
+
+    Returned unclamped, like free_pools. Legacy untagged rows cannot exist - the
+    flow that writes them shipped with the split fields - but stock moving out
+    from under a live reservation can still drive a half negative, and the
+    caller decides whether that reads as zero.
+    """
+    main_stock = _stock_qty(
+        item_code, warehouse, None, None, "UNTAGGED", in_main=True
+    )
+    lab_stock = _stock_qty(
+        item_code, warehouse, None, None, "UNTAGGED", warehouses=lab_warehouses
+    )
+
+    lab_allocated = _untagged_allocated_qty(
+        item_code, employee_function, batch_planning, "global",
+        component="lab", exclude_parent=exclude_parent, for_update=for_update,
+    )
+    main_allocated = _untagged_allocated_qty(
+        item_code, employee_function, batch_planning, "global",
+        component="main", exclude_parent=exclude_parent, for_update=for_update,
+    )
+
+    return {
+        "main_stock": main_stock,
+        "lab_stock": lab_stock,
+        "lab_allocated": lab_allocated,
+        "main_allocated": main_allocated,
+        "lab_free": lab_stock - lab_allocated,
+        "main_free": main_stock - main_allocated,
     }
 
 
@@ -1612,6 +1965,33 @@ def free_stock_figures(
     names for existing consumers, but no longer drive any column: they were
     needed to make untagged legacy stock safe to reason about, and untagged
     stock is now excluded outright.
+
+    WHICH RECONCILIATION HOLDS, AND WHICH DOES NOT. The Allocated column stacks
+    a pool-side figure over a batch-side one, and only the first of them closes
+    against Main Wh and Free Qty:
+
+        GLOBAL line   other_main_stock - other_allocated_total = other_free_stock
+
+    holds in every state, because other_allocated_total is defined as everything
+    drawn out of that pile — other batches' own draws PLUS this batch's
+    borrowing.
+
+        CURRENT line  bp_main_stock - bp_allocated = bp_free_stock
+
+    does NOT hold, and no display choice can make it. bp_allocated is what this
+    batch reserved wherever it came from, so it counts borrowed units that are
+    physically in the other batches' pile and absent from bp_main_stock. A batch
+    owning nothing and borrowing 10 reads main 0, allocated 10, free 0.
+
+    The universal invariant on this line is pool-side, not batch-side, and it is
+    exactly what free_pools computes:
+
+        bp_main_stock = bp_local_allocated + other_global_allocated + bp_free_stock
+
+    i.e. this batch's stock equals what it reserved out of itself, plus what
+    other batches borrowed from it, plus what is left. Every term is a claim
+    against the same physical pile. Anyone reconciling the Allocated column by
+    hand should use this, not the displayed Current figure.
     """
     bp_main = _stock_qty(item_code, warehouse, project, batch_planning, "BP", in_main=True)
 
@@ -1854,31 +2234,32 @@ def get_material_planning_data(doc_name):
             item_code, employee_function, doc.project, doc.name, "BP"
         )
 
-        # BOTH allocation sources are credited, by explicit business decision:
-        # an allocation locks material to this batch, and locked material is not
-        # to be purchased again. The two terms are NOT symmetric, though, and the
-        # difference matters when reading this figure:
+        # ONLY the global allocation is credited. The two sources are not
+        # symmetric, and treating them as if they were is what made this figure
+        # under-state the requirement:
         #
-        #   bp_global_allocated  borrowed from other batches' tagged stock. Those
-        #                        units are outside bp_main_stock, so this term is
-        #                        the only place they are credited.
+        #   bp_global_allocated  borrowed from OTHER batches' tagged stock.
+        #                        Those units sit outside bp_main_stock, so this
+        #                        term is the only place they are credited. It
+        #                        must be subtracted.
         #
-        #   bp_local_allocated   drawn from this batch's OWN free stock, so these
-        #                        units are already inside bp_main_stock and are
-        #                        credited a second time here. Deliberate. On any
-        #                        row where bp_main_stock < qty_required, Net Req
-        #                        therefore reads low by the locally-allocated qty
-        #                        and under-states what must be bought.
+        #   bp_local_allocated   drawn from this batch's OWN stock, so the units
+        #                        are ALREADY inside bp_total_stock. Subtracting
+        #                        it as well credited the same material twice.
         #
-        # Anyone reconciling a purchase shortfall against this column should
-        # start here: subtract Allocated's local line back out to get the
-        # physically-backed requirement.
+        # Worked through — BOM 100, own main 40, lab 0, 40 reserved locally and
+        # 10 borrowed. The batch physically controls 50, so Net Req is 50. The
+        # old form read 100 - 40 - 0 - 10 - 40 = 10, understating by the whole
+        # local reservation. Grouping Lab into Total Stock does not fix this:
+        # 100 - (40+0) - (40+10) is the same 10, term for term.
+        #
+        # Consequence, accepted deliberately: Net Req rises on every item with a
+        # local allocation, and it feeds get_batch_wise_shortages, so Material
+        # Request quantities rise with it. That is the honest number.
         net_requirement = max(
             qty_required
-            - bp_main_stock
-            - lab_stock
+            - bp_total_stock
             - bp_global_allocated
-            - bp_local_allocated
             - bp_mr_qty
             - bp_po_qty,
             0.0,
@@ -1942,6 +2323,792 @@ def get_material_planning_data(doc_name):
         "cutover_datetime": str(cutover) if cutover else None,
         "free_qty_pending": not cutover,
     }
+
+_UNTAGGED_COLUMN = {
+    "total": "mai.allocate_qty",
+    "lab": "IFNULL(mai.lab_allocated_qty, 0)",
+    "main": "IFNULL(mai.main_allocated_qty, 0)",
+}
+
+
+def _untagged_allocated_qty(
+    item_code,
+    employee_function,
+    batch_planning,
+    scope,
+    component="total",
+    exclude_parent=None,
+    for_update=False,
+):
+    """Reservations drawn from the UNTAGGED pool.
+
+    This returned a hardcoded 0.0 until Material Allocation Item gained
+    source_pool. It now counts real rows, and the two figures it feeds — Free
+    Qty and Lab Item (After Alloc) — move for the first time.
+
+    scope is "global" (everything drawn out of the untagged pile by this
+    Employee Function, inclusive of this batch's own draw) or "current" (this
+    batch's own draw).
+
+    component picks WHICH PART of the reservation to total:
+
+        "total"  allocate_qty — the whole untagged draw. What Free Qty subtracts.
+        "lab"    the portion taken from stock already sitting in the labs.
+        "main"   the portion reserved out of the main store, which is the only
+                 part that will ever physically move.
+
+    NO PROJECT FILTER, deliberately, and this is not an oversight copied from
+    _allocated_qty — that function scopes on ma.project_id because every figure
+    it feeds is project-scoped. This tab is not: untagged rows almost never
+    carry a Project, which is the whole reason the tab exists (see
+    get_untagged_material_data and _project_clause). Adding one here would
+    subtract nothing from a Free Qty that was measured without one, and the
+    Allocated column would read 0 against stock that is plainly reserved.
+
+    Employee Function is the scope that does the real work, matching how the
+    stock side of this tab is bounded.
+
+    Counts only allocations in status "Allocated", the same gate _allocated_qty
+    uses — see _HOLDS_STOCK. A saved draft reserves no untagged stock, so Free
+    Qty and Labware on the tab do not move until Allocate is pressed.
+
+    exclude_parent and for_update exist for the save-time re-check, exactly as
+    they do on _allocated_qty: a document being re-saved is already in the
+    table, so counting it would make it compete with itself, and the pools must
+    be locked while they are read or two allocations racing for the last
+    untagged units would both pass. The report passes neither - it must never
+    hold locks.
+    """
+    if scope == "current":
+        scope_sql = "AND ma.batch_planning = %(scope)s"
+        scope_value = batch_planning
+    else:
+        scope_sql = "AND ma.employee_function = %(scope)s"
+        scope_value = employee_function
+
+    exclude_sql = "AND ma.name <> %(exclude)s" if exclude_parent else ""
+    lock_sql = "FOR UPDATE" if for_update else ""
+
+    return flt(
+        frappe.db.sql(
+            f"""
+        SELECT IFNULL(SUM({_UNTAGGED_COLUMN[component]}), 0)
+        FROM `tabMaterial Allocation Item` mai
+        INNER JOIN `tabMaterial Allocation` ma ON ma.name = mai.parent
+        WHERE mai.item_code = %(item_code)s
+          {scope_sql}
+          {exclude_sql}
+          AND {_POOL_COLUMN} = 'Untagged'
+          AND {_HOLDS_STOCK}
+          AND ma.docstatus != 2
+        {lock_sql}
+        """,
+            {
+                "item_code": item_code,
+                "scope": scope_value,
+                "exclude": exclude_parent,
+            },
+        )[0][0]
+        or 0.0
+    )
+
+
+@frappe.whitelist()
+def get_untagged_material_data(doc_name):
+    """Untagged Materials tab — stock and pipeline carrying no batch tag.
+
+    The same items as Material Planning, measured against the opposite pool.
+    Where that tab shows what THIS batch and other batches have claimed, this
+    one shows what nobody has: rows raised before batch planning existed, which
+    every tagged column deliberately excludes.
+
+    SCOPED BY EMPLOYEE FUNCTION ONLY. No project filter anywhere — see
+    _project_clause. Untagged rows almost never carry a Project, so filtering on
+    one returns zero for precisely the stock this tab exists to surface. The EF
+    still bounds the query, through its store warehouse for stock and through
+    the EF columns for MR/PO/GRN.
+
+    ROWS ARE THE CONSOLIDATED BOM ITEMS, not every item holding untagged stock.
+    Two reasons. Qty Req and Net Req are only meaningful against demand, and the
+    volume settles it: this site carries 860-3,549 distinct items with untagged
+    ledger rows per warehouse, against 50-64 BOM items on a typical plan. An
+    item-driven table would be four figures of rows, almost all irrelevant to
+    the batch being planned.
+
+    FREE QTY CREDITS LAB (decided 2026-09-07). Free Qty is
+    (Main Wh + Lab Item) - Allocated(Global): every untagged unit counts as
+    available wherever it physically sits, until a Material Allocation reserves
+    it. The tab shipped with lab excluded, on the reasoning that untagged lab
+    stock was old unclaimed material and not this batch's until formally
+    allocated; the untagged allocation flow is that formal claim, so the
+    allocatable pool and the coverage figure now agree. Net Req drops on any row
+    holding untagged lab stock, which is the intended consequence.
+
+    Allocation figures are real from this release. They were hardcoded 0 while
+    nothing could reserve untagged stock — see _untagged_allocated_qty, which
+    now counts Material Allocation Item rows carrying source_pool = Untagged.
+    """
+    doc = frappe.get_doc("Batch Planning", doc_name)
+    employee_function = doc.custom_employee_function
+    if not employee_function:
+        frappe.throw("Employee Function is not set on this document.")
+
+    ef_doc = frappe.get_doc("Employee Function", employee_function)
+    warehouse = next(
+        (r.store_warehouse for r in (ef_doc.table_bukm or []) if r.store_warehouse),
+        None,
+    )
+    if not warehouse:
+        frappe.throw(
+            f"No store warehouse found in Employee Function '{employee_function}'."
+        )
+
+    lab_warehouses = _ef_lab_warehouses(ef_doc)
+
+    consolidated_items = get_consolidated_bom_components(doc_name, scale="stock")
+
+    res = []
+    for item in consolidated_items:
+        item_code = item.get("item_code")
+        qty_required = flt(item.get("qty"))
+
+        # project=None drops the Project predicate; bp=None is unused by the
+        # UNTAGGED branch of _bp_predicate and is passed only to keep the
+        # shared signature.
+        main_stock = _stock_qty(
+            item_code, warehouse, None, None, "UNTAGGED", in_main=True
+        )
+        # Positively scoped to this function's declared lab warehouses. NOT
+        # in_main=False — with no batch tag to confine the rows, that clause
+        # matches every warehouse in the company. See _stock_qty.
+        lab_stock = _stock_qty(
+            item_code, warehouse, None, None, "UNTAGGED", warehouses=lab_warehouses
+        )
+
+        global_allocated = _untagged_allocated_qty(
+            item_code, employee_function, doc.name, "global"
+        )
+        current_allocated = _untagged_allocated_qty(
+            item_code, employee_function, doc.name, "current"
+        )
+
+        # Only the main-sourced share of this batch's own draw will ever move —
+        # see lab_after_alloc below for why that distinction matters.
+        current_main_allocated = _untagged_allocated_qty(
+            item_code, employee_function, doc.name, "current", component="main"
+        )
+
+        # The lab-sourced share of every untagged draw on this pool. It drives
+        # the SYMBOLIC lab_item -> Labware move: units claimed out of the lab
+        # stop counting as free Lab Item and appear under Labware instead.
+        #
+        # Symbolic in the strict sense — no Stock Entry, no ledger row, nothing
+        # physically relocates. Those units were always standing in the lab
+        # warehouses; allocation only records who they belong to. Labware is the
+        # readout of that claim, not a warehouse. See the lock recorded on
+        # MaterialAllocation.deallocate.
+        lab_allocated = _untagged_allocated_qty(
+            item_code, employee_function, doc.name, "global", component="lab"
+        )
+
+        # What the ALLOCATED column shows: the MAIN-sourced share only.
+        #
+        # The lab-sourced share is reported under Labware instead, and showing it
+        # in both places read as double the reservation. The split is also what
+        # the two columns MEAN: Labware is stock the batch already has standing
+        # in the lab, while Allocated is stock still sitting in the store waiting
+        # on a physical transfer. Only the second is outstanding work.
+        #
+        # Derived, not queried — global total minus its lab half — so the column
+        # costs nothing extra on a fifty-row plan.
+        #
+        # Free Qty still subtracts the WHOLE reservation (see below); it is the
+        # display that splits, not the arithmetic. The row still reconciles:
+        #     Main Wh + Lab Item - Allocated = Free Qty
+        # because Lab Item has already given up the lab-sourced share.
+        global_main_allocated = global_allocated - lab_allocated
+
+        # GROSS, deliberately, and it stays gross once Labware starts moving.
+        # Total Stock is the reconciliation against what is physically on the
+        # shelf, and every unit is still there whoever has claimed it. Netting
+        # the allocation out here would make the column disagree with the
+        # warehouse and would double-count it, since Free Qty already subtracts
+        # the same reservation.
+        total_stock = main_stock + lab_stock
+
+        # What Lab Item DISPLAYS: the unclaimed remainder. lab_stock stays the
+        # gross figure above so Total Stock = Main Wh + lab_stock still holds and
+        # the per-warehouse drill-down still reconciles.
+        lab_available = lab_stock - lab_allocated
+
+        # One pool, so one subtraction. The tagged tab needs free_pools because
+        # it has two piles and must charge each draw to the one it came from;
+        # here there is only the untagged pile, and everything reserved out of
+        # it is in Allocated (Global) by definition.
+        #
+        # Both halves of that pile are offered: stock in the store and stock
+        # already standing in the labs are equally unclaimed while untagged, so
+        # Free Qty is measured against Total Stock, not against Main Wh alone.
+        free_qty = total_stock - global_allocated
+
+        # Projection only, never persisted: what the lab would hold once the
+        # current reservation is physically transferred.
+        #
+        # ONLY THE MAIN-SOURCED PORTION IS ADDED, and using current_allocated
+        # here instead would be a double count. Lab-sourced allocation moves
+        # nothing: those units are already standing in the lab, so they are
+        # already inside lab_stock. Adding the whole reservation would promise a
+        # lab holding that no transfer will ever deliver — on an item covered
+        # entirely from lab stock it would project double what is there.
+        lab_after_alloc = lab_stock + current_main_allocated
+
+        mr_qty, mr_count, mr_docs = _open_mr(
+            item_code, employee_function, None, None, "UNTAGGED"
+        )
+        po_qty, po_count, po_docs = _open_po(
+            item_code, employee_function, None, None, "UNTAGGED"
+        )
+        pr_qty, pr_count, pr_docs = _open_pr_grn(
+            item_code, employee_function, None, None, "UNTAGGED"
+        )
+
+        # Credits Free Qty, NOT Total Stock — so untagged lab stock is not
+        # counted as coverage. This is the specified formula and it differs
+        # from the tagged tab, which does credit its own lab stock. Unapproved
+        # GRN is display-only here exactly as it is there: those units are
+        # already credited through Open PO, which does not release until the
+        # receipt is approved.
+        net_requirement = max(
+            qty_required - free_qty - mr_qty - po_qty, 0.0
+        )
+
+        res.append(
+            {
+                "item_code": item_code,
+                "item_name": item.get("item_name"),
+                "uom": item.get("uom"),
+                "qty_required": round(qty_required, 2),
+                "total_stock": round(total_stock, 2),
+                "main_stock": round(main_stock, 2),
+                "global_allocated": round(global_allocated, 2),
+                "current_allocated": round(current_allocated, 2),
+                "current_main_allocated": round(current_main_allocated, 2),
+                "global_main_allocated": round(global_main_allocated, 2),
+                "free_qty": round(free_qty, 2),
+                "lab_stock": round(lab_stock, 2),
+                "lab_available": round(lab_available, 2),
+                "labware_qty": round(lab_allocated, 2),
+                "lab_after_alloc": round(lab_after_alloc, 2),
+                "mr_qty": mr_qty,
+                "mr_count": mr_count,
+                "mr_docs": mr_docs,
+                "po_qty": po_qty,
+                "po_count": po_count,
+                "po_docs": po_docs,
+                "pr_qty": pr_qty,
+                "pr_count": pr_count,
+                "pr_docs": pr_docs,
+                "net_requirement": round(net_requirement, 2),
+            }
+        )
+
+    return {
+        "results": res,
+        "warehouse": warehouse,
+        "employee_function": employee_function,
+        # Untagged stock can be reserved from this release, so the tab no longer
+        # prints the "allocation not yet available" caveat and the Lab Item cell
+        # goes back to the stacked Existing / After Alloc pair — the two figures
+        # can now differ.
+        "allocation_pending": False,
+    }
+
+
+@frappe.whitelist()
+def create_untagged_material_allocation(batch_planning_name):
+    """Bulk allocation against the UNTAGGED pool, every item in one pass.
+
+    The sibling of create_bulk_material_allocations, not a variant of it. The
+    two share a shape — consolidate the BOM, size each row against a pool,
+    return an UNSAVED document for the user to review — and share nothing else,
+    because they draw on different stock under different accounting:
+
+        create_bulk_material_allocations   batch-tagged pools, local-first,
+                                           free_stock_figures, project-scoped
+        this                               the untagged pile, LAB-FIRST,
+                                           untagged_free_figures, EF-scoped
+
+    Kept apart rather than merged behind a flag. Every line of the tagged
+    builder that looks reusable — the lab_stock deduction, split_local_first,
+    the shared-stock warning — is answering a question this pool does not ask,
+    and a single function serving both would have to be read twice to be read
+    at all.
+
+    NOTHING IS QUERIED FROM THE CLIENT. get_untagged_material_data is re-run
+    here, on the server, so the quantities allocated are the ones true at the
+    moment of the click and not whatever the tab was painted with — which may be
+    minutes old and may predate another batch's allocation.
+
+    LAB FIRST, then main store. See split_lab_first for why that order is a rule
+    rather than a preference. The two portions are recorded separately on every
+    row (lab_allocated_qty / main_allocated_qty) because they behave differently
+    forever after: the lab portion is symbolic and never moves — those units are
+    already standing in the lab — while the main portion is a reservation that
+    a Stock Entry will later turn into a physical Main -> Lab transfer.
+
+    NO CROSS-FLOW CHECK, deliberately. A Batch Planning may carry both a tagged
+    and an untagged allocation, and this does not look at what the tagged flow
+    has already reserved. check_batch_planning_allocation_limit is the single
+    ceiling — total allocated per item across every allocation on the plan may
+    not exceed quantity_required — and it is enforced at save on both flows. If
+    the two together exceed the BOM requirement the second one to be saved is
+    rejected there, with the arithmetic spelled out, which is the intended
+    behaviour rather than a gap.
+
+    Returned UNSAVED, like create_bulk_material_allocations and
+    make_material_request. Nothing is inserted, so a draft the user abandons
+    leaves no record to clean up.
+    """
+    parent_doc = frappe.get_doc("Batch Planning", batch_planning_name)
+    if getattr(parent_doc, "workflow_state", None) != "Approved":
+        frappe.throw("Document is not in Approved state.")
+    if parent_doc.docstatus != 1:
+        frappe.throw("Document is not submitted yet.")
+
+    if not parent_doc.custom_employee_function:
+        frappe.throw("Employee Function is not set on Batch Planning.")
+
+    employee_function = parent_doc.custom_employee_function
+    ef_doc = frappe.get_doc("Employee Function", employee_function)
+    warehouse = next(
+        (r.store_warehouse for r in (ef_doc.table_bukm or []) if r.store_warehouse),
+        None,
+    )
+    if not warehouse:
+        frappe.throw(
+            f"No store warehouse found for Employee Function {employee_function}"
+        )
+
+    lab_warehouses = _ef_lab_warehouses(ef_doc)
+
+    warning_message = ""
+    existing = frappe.db.sql(
+        """
+        SELECT DISTINCT ma.name
+        FROM `tabMaterial Allocation` ma
+        INNER JOIN `tabMaterial Allocation Item` mai ON mai.parent = ma.name
+        WHERE ma.batch_planning = %(bp)s
+          AND COALESCE(NULLIF(mai.source_pool, ''), 'Tagged') = 'Untagged'
+          AND ma.allocation_status <> 'Deallocated'
+          AND ma.docstatus <> 2
+        LIMIT 1
+        """,
+        {"bp": batch_planning_name},
+    )
+    if existing:
+        warning_message = (
+            f"Note: an untagged Material Allocation ({existing[0][0]}) already "
+            f"exists for Batch Planning {batch_planning_name}. Anything it holds "
+            f"is already out of the pool below."
+        )
+
+    # Fresh, server-side, and the same call the tab makes — so Qty Req and the
+    # free figures on the draft cannot disagree with what the user was looking at
+    # for any reason other than the passage of time.
+    report = get_untagged_material_data(batch_planning_name)
+
+    rows = []
+    skipped_no_stock = []
+    skipped_below_one = []
+    skipped_already_allocated = []
+    skipped_lab_covered = []
+
+    # Shared with the tagged builder on purpose — see _bp_allocated_by_item. An
+    # item this plan has already reserved in full has no headroom left under
+    # check_batch_planning_allocation_limit, whichever pool did the reserving.
+    already = _bp_allocated_by_item(batch_planning_name)
+
+    for item in report["results"]:
+        item_code = item["item_code"]
+        qty_required = flt(item["qty_required"])
+        if qty_required <= 0:
+            continue
+
+        # ONLY ROWS THE TAB SHOWS AS HAVING SOMETHING FREE, and taken from the
+        # report row rather than recomputed, so the button takes exactly the
+        # items someone reading the Free Qty column expects it to take.
+        #
+        # Not the same test as `capacity > 0` below, and the difference is not
+        # academic. Free Qty is (main + lab) - allocated as ONE figure, while
+        # capacity clamps each half at zero before adding them. An item whose
+        # lab half has gone negative — stock moved out from under a live
+        # reservation — reads as covered on one and available on the other:
+        # lab -10 with main +5 is Free Qty -5 on the tab and capacity 5 here.
+        # Allocating that would hand out units against a row the user was just
+        # told had nothing.
+        #
+        # Cheap, too: skipping here avoids the four queries untagged_free_figures
+        # costs, on every one of fifty rows that has nothing to give.
+        if flt(item["free_qty"]) <= 0:
+            skipped_no_stock.append(item_code)
+            continue
+
+        # WHAT THIS BATCH ALREADY HOLDS UNDER ITS OWN TAG, in its labs. This is
+        # the half that live reservations do not describe, and missing it is
+        # what kept fully-supplied items on offer.
+        #
+        # A finished allocation leaves NO live reservation behind: on Stock Entry
+        # submit allocation_status becomes 'Stock Entry Done', which
+        # _bp_allocated_by_item excludes by the same rule every other consumer in
+        # this app uses. That exclusion is right — the reservation is over — but
+        # the material did not disappear, it ARRIVED. It is now tagged to this
+        # batch and standing in the lab, and it satisfies the BOM line as
+        # completely as a reservation does.
+        #
+        # BP-26-10-001 is the worked example: CN02010004 needs 50, its allocation
+        # reached Stock Entry Done, and 50 units now sit in the lab under this
+        # batch's tag. Counting only reservations read that as "nothing
+        # allocated" and offered all 50 again, against an untagged pile of
+        # 45,000 that has no idea the requirement is already met.
+        #
+        # Not double counting: an untransferred allocation has a reservation and
+        # no lab stock, a transferred one has lab stock and no reservation. The
+        # two terms are disjoint by construction, which is why they sum. This is
+        # the same lab_stock deduction create_bulk_material_allocations has
+        # always made — it was only ever missing here.
+        bp_lab_stock = _stock_qty(
+            item_code,
+            warehouse,
+            parent_doc.project,
+            batch_planning_name,
+            "BP",
+            in_main=False,
+        )
+        reserved = already.get(item_code, 0.0)
+
+        outstanding = qty_required - bp_lab_stock - reserved
+        if outstanding <= 0:
+            # Reported apart because they read as opposite things: one says the
+            # material is already standing in the lab, the other says it is
+            # spoken for but has not moved yet.
+            if bp_lab_stock > 0:
+                skipped_lab_covered.append(item_code)
+            else:
+                skipped_already_allocated.append(item_code)
+            continue
+
+        figures = untagged_free_figures(
+            item_code,
+            warehouse,
+            lab_warehouses,
+            employee_function,
+            batch_planning_name,
+        )
+
+        lab_free = max(figures["lab_free"], 0.0)
+        main_free = max(figures["main_free"], 0.0)
+        capacity = lab_free + main_free
+
+        allocate_qty = min(outstanding, capacity)
+
+        # Material Allocation.validate rejects anything under 1, so a row that
+        # would carry 0 must not be emitted at all rather than emitted and left
+        # for the user to delete. Nothing is free for these items; that is what
+        # Net Req on the tab is for.
+        #
+        # The Free Qty gate above already dropped the empty rows. This still runs
+        # because the report and untagged_free_figures are separate reads: a
+        # concurrent allocation between them can empty a pool that had stock a
+        # moment ago, and emitting a zero row would fail at save instead of here.
+        if allocate_qty <= 0:
+            skipped_no_stock.append(item_code)
+            continue
+        if allocate_qty < 1:
+            skipped_below_one.append(item_code)
+            continue
+
+        split = split_lab_first([allocate_qty], lab_free, main_free)
+
+        # Cannot trigger as written — allocate_qty is clamped to capacity above —
+        # but split_lab_first's per-row figures deliberately still sum to the
+        # full request when the pools cannot cover it, so a caller that trusts
+        # them without checking is one edit away from silently over-reserving.
+        if split["shortfall"] > 0:
+            skipped_no_stock.append(item_code)
+            continue
+
+        from_lab = split["rows"][0]["from_lab"]
+        from_main = split["rows"][0]["from_main"]
+
+        row = {
+            "doctype": "Material Allocation Item",
+            "parenttype": "Material Allocation",
+            "parentfield": "material_allocation",
+            "item_code": item_code,
+            "item_name": item.get("item_name"),
+            "uom": item.get("uom"),
+            "quantity_required": qty_required,
+            "allocate_qty": round(allocate_qty, 2),
+            "stock_available": round(capacity, 2),
+            "source_pool": "Untagged",
+            "lab_allocated_qty": round(from_lab, 2),
+            "main_allocated_qty": round(from_main, 2),
+        }
+
+        # validate demands a Reason whenever Qty Requested differs from BOM Qty,
+        # and partial coverage is the normal case here — the untagged pile is
+        # whatever happened to be bought without a batch tag, not a pile sized to
+        # this plan. Filling it in beats making the user retype the same sentence
+        # on most of fifty rows. Same reasoning as create_bulk_material_allocations.
+        if round(allocate_qty, 2) != round(qty_required, 2):
+            reason = (
+                f"Untagged pool covers {round(allocate_qty, 2)} of "
+                f"{round(qty_required, 2)} {item.get('uom') or ''}".strip()
+                + f" (lab {round(lab_free, 2)} + main store {round(main_free, 2)})"
+            )
+            if bp_lab_stock > 0:
+                reason += f"; {round(bp_lab_stock, 2)} already held in this batch's lab"
+            if reserved > 0:
+                reason += f"; {round(reserved, 2)} already reserved on this plan"
+            row["reason"] = reason + "."
+
+        rows.append(row)
+
+    if not rows:
+        covered = skipped_already_allocated or skipped_lab_covered
+        if covered and not (skipped_no_stock or skipped_below_one):
+            frappe.throw(
+                "Nothing to allocate — every item on this Batch Planning is already "
+                "covered, either by stock this batch holds in its lab or by an "
+                "existing allocation. Deallocate one first if you need to reissue it."
+            )
+        if (skipped_no_stock or skipped_below_one or skipped_already_allocated
+                or skipped_lab_covered):
+            frappe.throw(
+                "Nothing to allocate — no untagged stock is free for any item on "
+                "this Batch Planning. Check Free Qty on the Untagged Materials tab."
+            )
+        frappe.throw("No items found to allocate.")
+
+    notes = []
+    if warning_message:
+        notes.append(warning_message)
+    if skipped_no_stock:
+        notes.append(
+            f"{len(skipped_no_stock)} item(s) skipped — no free untagged stock: "
+            + ", ".join(skipped_no_stock[:10])
+            + ("..." if len(skipped_no_stock) > 10 else "")
+        )
+    if skipped_below_one:
+        notes.append(
+            f"{len(skipped_below_one)} item(s) skipped — under 1 unit free, which "
+            "Material Allocation will not accept: "
+            + ", ".join(skipped_below_one[:10])
+            + ("..." if len(skipped_below_one) > 10 else "")
+        )
+    if skipped_lab_covered:
+        notes.append(
+            f"{len(skipped_lab_covered)} item(s) skipped — already delivered into "
+            "this batch's lab by a completed allocation: "
+            + ", ".join(skipped_lab_covered[:10])
+            + ("..." if len(skipped_lab_covered) > 10 else "")
+        )
+    if skipped_already_allocated:
+        notes.append(
+            f"{len(skipped_already_allocated)} item(s) skipped — already reserved "
+            "in full on this Batch Planning: "
+            + ", ".join(skipped_already_allocated[:10])
+            + ("..." if len(skipped_already_allocated) > 10 else "")
+        )
+
+    ma_data = {
+        "doctype": "Material Allocation",
+        "batch_planning": batch_planning_name,
+        "employee_function": employee_function,
+        "project_id": parent_doc.project,
+        "project_name": (
+            frappe.db.get_value("Project", parent_doc.project, "project_name")
+            if parent_doc.project
+            else ""
+        ),
+        "workflow_state": "Draft",
+        "material_allocation": rows,
+    }
+    if notes:
+        ma_data["warning"] = "<br>".join(notes)
+    return ma_data
+
+
+@frappe.whitelist()
+def get_untagged_lab_breakdown(doc_name, item_code):
+    """The per-warehouse split behind one row's Lab Item figure.
+
+    Called on demand from the Untagged Materials tab, not folded into
+    get_untagged_material_data: that would cost one query per item per lab
+    warehouse on every load (50 items x 5-7 warehouses = 250-350 queries) to
+    populate a panel almost nobody opens. Here it is 5-7 queries, once, on click.
+
+    Deliberately loops _stock_qty per warehouse rather than issuing a single
+    GROUP BY. One extra query per lab is cheap; a second copy of "what counts as
+    untagged stock" is not. The summed figure on the row and the parts in this
+    breakdown come from the identical code path, so they cannot drift — which is
+    the entire reason the drill-down exists, since its job is to let someone
+    check the sum instead of trusting it.
+    """
+    doc = frappe.get_doc("Batch Planning", doc_name)
+    employee_function = doc.custom_employee_function
+    if not employee_function:
+        frappe.throw("Employee Function is not set on this document.")
+
+    ef_doc = frappe.get_doc("Employee Function", employee_function)
+    warehouse = next(
+        (r.store_warehouse for r in (ef_doc.table_bukm or []) if r.store_warehouse),
+        None,
+    )
+    lab_warehouses = _ef_lab_warehouses(ef_doc)
+
+    rows = []
+    for lab in lab_warehouses:
+        qty = _stock_qty(
+            item_code, warehouse, None, None, "UNTAGGED", warehouses=[lab]
+        )
+        rows.append({"warehouse": lab, "qty": round(qty, 2)})
+
+    gross = sum(r["qty"] for r in rows)
+    # Lab Item on the row is now net of the lab-sourced claim, so the
+    # per-warehouse rows alone no longer sum to it. Both figures are returned so
+    # the dialog can show the subtraction rather than appear to contradict the
+    # table it exists to explain.
+    allocated = _untagged_allocated_qty(
+        item_code, employee_function, doc_name, "global", component="lab"
+    )
+    return {
+        "item_code": item_code,
+        "employee_function": employee_function,
+        "rows": rows,
+        "total": round(gross, 2),
+        "allocated": round(allocated, 2),
+        "available": round(gross - allocated, 2),
+    }
+
+
+@frappe.whitelist()
+def get_untagged_main_breakdown(doc_name, item_code):
+    """This item's untagged store stock, split by Project.
+
+    Scoped to the Batch Planning's OWN Employee Function and its store
+    warehouse — the same warehouse and the same untagged predicate the Main Wh
+    column uses — so the rows always sum to the figure on the row. That
+    reconciliation is the point: the drill-down exists to let someone check the
+    number, not to decorate it.
+
+    Other Employee Functions are deliberately not reported. Their stock is not
+    this batch's to plan against, and showing it invited the reading that the
+    two could be added together.
+
+    Project is COALESCEd to a visible label rather than dropped. Untagged rows
+    are overwhelmingly project-less — that is what makes them untagged — so a
+    breakdown that hid the NULL bucket would show almost nothing and imply the
+    stock did not exist.
+    """
+    doc = frappe.get_doc("Batch Planning", doc_name)
+    employee_function = doc.custom_employee_function
+    if not employee_function:
+        frappe.throw("Employee Function is not set on this document.")
+
+    ef_doc = frappe.get_doc("Employee Function", employee_function)
+    warehouse = next(
+        (r.store_warehouse for r in (ef_doc.table_bukm or []) if r.store_warehouse),
+        None,
+    )
+    if not warehouse:
+        frappe.throw(
+            f"No store warehouse found in Employee Function '{employee_function}'."
+        )
+
+    # project_name comes from a LEFT join, not a lookup per row: the drill-down
+    # is opened on click and should stay one query however many projects hold the
+    # item. LEFT rather than INNER because the NULL-project bucket is usually the
+    # biggest one here — untagged rows overwhelmingly carry no project, which is
+    # what makes them untagged — and an inner join would silently drop it.
+    this_ef = frappe.db.sql(
+        """
+        SELECT COALESCE(NULLIF(sle.project, ''), '(no project)') AS project_id,
+               COALESCE(MAX(p.project_name), '') AS project_name,
+               ROUND(SUM(sle.actual_qty), 2) AS qty
+        FROM `tabStock Ledger Entry` sle
+        LEFT JOIN `tabProject` p ON p.name = sle.project
+        WHERE sle.item_code = %(item)s
+          AND sle.warehouse = %(warehouse)s
+          AND sle.is_cancelled = 0
+          AND (sle.batch_planning_id IS NULL OR sle.batch_planning_id = '')
+        -- Aliased project_id, NOT project. `project` is also a real column on
+        -- Stock Ledger Entry, and MariaDB binds an ambiguous name in GROUP BY
+        -- and ORDER BY to the COLUMN, not the select alias. That silently broke
+        -- both: the ordering test compared the raw value against the placeholder
+        -- text and never matched, and grouping by the raw column would split
+        -- NULL and '' into two rows both labelled "(no project)".
+        GROUP BY project_id
+        HAVING SUM(sle.actual_qty) <> 0
+        -- By project NAME, with the nameless bucket last. Ordering by quantity
+        -- put whichever project happened to hold most at the top, so the same
+        -- item reordered itself between visits and there was nowhere predictable
+        -- to look for a given project. "(no project)" sorts to the bottom
+        -- because it is not a project; it is the absence of one, and it is
+        -- usually the largest bucket here, which would otherwise pin an
+        -- uninformative row to the top of every drill-down.
+        ORDER BY (project_id = '(no project)') ASC,
+                 project_name ASC,
+                 project_id ASC
+        """,
+        {"item": item_code, "warehouse": warehouse},
+        as_dict=True,
+    )
+
+    # NEGATIVE BUCKETS ARE FOLDED INTO "(no project)" RATHER THAN DISPLAYED.
+    #
+    # A negative bucket means stock left the store stamped with that project but
+    # never arrived under it: `project` on a ledger row records what a movement
+    # was FOR, not which pile it came from. Goods received unattributed and later
+    # issued against a project leave the issue stranded in that project's bucket
+    # with nothing to offset it. It reads as a shortage and is not one.
+    #
+    # Simply hiding those rows would be worse: the visible rows would sum past
+    # the total, and reconciling against Main Wh is the only job this drill-down
+    # has. Clamping them to zero has the same effect.
+    #
+    # So the unmatched issue is charged back to the pile that actually funded it.
+    # "(no project)" is the only honest destination — it is not a claim about any
+    # project, it is the absence of one, and unattributed stock is by definition
+    # where an unattributed receipt sits. The total is unchanged and still equals
+    # Main Wh on the row.
+    #
+    # If folding would drive "(no project)" itself negative, the fold is abandoned
+    # and every row is shown as-is. That means more was issued against projects
+    # than was ever received unattributed, which is a real data problem worth
+    # seeing rather than smoothing away.
+    total = round(sum(flt(r.qty) for r in this_ef), 2)
+
+    negatives = sum(flt(r.qty) for r in this_ef if flt(r.qty) < 0)
+    if negatives:
+        unattributed = next(
+            (r for r in this_ef if r.project_id == "(no project)"), None
+        )
+        if unattributed and flt(unattributed.qty) + negatives >= 0:
+            unattributed.qty = round(flt(unattributed.qty) + negatives, 2)
+            this_ef = [
+                r for r in this_ef
+                if flt(r.qty) > 0 or r.project_id == "(no project)"
+            ]
+
+    return {
+        "item_code": item_code,
+        "employee_function": employee_function,
+        "warehouse": warehouse,
+        "this_ef": this_ef,
+        "this_ef_total": total,
+    }
+
 
 @frappe.whitelist()
 def make_material_request(doc_name):

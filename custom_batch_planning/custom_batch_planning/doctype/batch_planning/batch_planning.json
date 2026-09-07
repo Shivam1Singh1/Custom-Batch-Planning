@@ -24,6 +24,8 @@
   "custom_batch_details",
   "bom_component_tab",
   "bom_component_html",
+  "untagged_material_tab",
+  "untagged_material_html",
   "material_planning_tab",
   "material_planning_html",
   "stock_entry_tab",
@@ -156,6 +158,17 @@
    "fieldname": "bom_component_html",
    "fieldtype": "HTML",
    "label": "BOM Components View"
+  },
+  {
+   "depends_on": "eval:doc.docstatus == 1 || doc.workflow_state == 'Approved'",
+   "fieldname": "untagged_material_tab",
+   "fieldtype": "Tab Break",
+   "label": "Untagged Materials"
+  },
+  {
+   "fieldname": "untagged_material_html",
+   "fieldtype": "HTML",
+   "label": "Untagged Materials View"
   },
   {
    "depends_on": "eval:doc.docstatus == 1 || doc.workflow_state == 'Approved'",

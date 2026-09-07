@@ -313,6 +313,17 @@ frappe.ui.form.on('Batch Planning', {
         if (frm.doc.docstatus === 1 || frm.doc.workflow_state === 'Approved') {
             render_bom_components_tab(frm);
 
+            // Button-driven, exactly like Material Planning. This used to render
+            // eagerly on every refresh() — and refresh() fires on save, on
+            // workflow action and on every route back to the form, so each one
+            // cost a full get_untagged_material_data round trip (50 items, four
+            // queries apiece) whether or not anyone opened the tab.
+            if (frm._um_data && frm._um_data.length) {
+                render_untagged_materials_tab(frm);
+            } else {
+                render_untagged_materials_placeholder(frm);
+            }
+
             if (!frm._mp_data) {
                 const stored = localStorage.getItem('mp_' + frm.doc.name);
                 if (stored) {
@@ -335,9 +346,21 @@ frappe.ui.form.on('Batch Planning', {
             // week past its last booking — and the master is the document that
             // actually defines the period.
             //
-            // Run Material Planning is deliberately NOT gated. It only renders
-            // a read-only tab, and an expired batch still has to be readable;
-            // only the two document-creating actions are blocked.
+            // Run Material Planning is gated too, on the same date. A batch
+            // whose slot closed in August has nothing left to plan in
+            // September: every figure it would fetch describes a period that is
+            // over, and re-running it only invites someone to act on a stale
+            // requirement. This reverses the earlier decision to exempt it —
+            // the exemption existed to keep an expired batch readable, and the
+            // cost of that is spelled out below.
+            //
+            // READABILITY COST, ACCEPTED. The tab only auto-renders when
+            // frm._mp_data is already populated, which happens once the button
+            // has been pressed in THIS session (nothing writes the localStorage
+            // key it looks for). So on a fresh load of an expired batch the
+            // figures can no longer be brought up at all. The placeholder is
+            // swapped for one that says the slot closed, rather than leaving it
+            // inviting a click the guard will refuse.
             //
             // Buttons are removed inside the callback rather than before the
             // fetch, so two refreshes in flight at once cannot leave a
@@ -348,12 +371,39 @@ frappe.ui.form.on('Batch Planning', {
                     && frappe.datetime.str_to_obj(end_date) < today;
 
                 frm.remove_custom_button(__("Run Material Planning"));
+                frm.remove_custom_button(__("Run Untagged Materials"));
+                frm.remove_custom_button(__("Allocate Untagged Materials"), __("Create"));
                 frm.remove_custom_button(__("Material Allocation"), __("Create"));
                 frm.remove_custom_button(__("Material Request"), __("Create"));
 
-                frm.add_custom_button(__("Run Material Planning"), function () {
+                let $um_btn = frm.add_custom_button(__("Run Untagged Materials"), function () {
+                    if (slot_blocked(slot_expired)) return;
+                    // force: the button is the one place that should go back to
+                    // the server. Everywhere else repaints what is already held.
+                    render_untagged_materials_tab(frm, true);
+                });
+                if (slot_expired) {
+                    mark_slot_expired($um_btn);
+                    if (!(frm._um_data && frm._um_data.length)) {
+                        render_untagged_materials_placeholder(frm, true);
+                    }
+                }
+
+                let $mp_btn = frm.add_custom_button(__("Run Material Planning"), function () {
+                    if (slot_blocked(slot_expired)) return;
                     render_material_planning_tab(frm);
                 }).addClass("btn-primary");
+                if (slot_expired) {
+                    mark_slot_expired($mp_btn);
+                    // The placeholder was rendered before this promise resolved,
+                    // so it still reads "Click Run Material Planning above" next
+                    // to a button that will now refuse. Only replace it when the
+                    // table is not already on screen from an earlier run.
+                    if (!(frm._mp_data && frm._mp_data.length)) {
+                        render_material_planning_placeholder(frm, true);
+                    }
+                }
+
 
                 let $alloc_btn = frm.add_custom_button(__("Material Allocation"), function () {
                     if (slot_blocked(slot_expired)) return;
@@ -441,6 +491,83 @@ frappe.ui.form.on('Batch Planning', {
                     });
                 }, __("Create"));
                 if (slot_expired) mark_slot_expired($alloc_btn);
+
+                // Bulk allocation against the untagged pool.
+                //
+                // Sits under Create, directly beside the tagged "Material
+                // Allocation" it parallels — the two build the same document
+                // from different stock, so they belong in the same menu.
+                //
+                // The label must stay distinct from "Material Allocation".
+                // frm.remove_custom_button matches on (label, group), so two
+                // entries sharing a label in one group would collide on every
+                // rebuild — and they draw on completely different stock under
+                // different accounting, which the menu has to make obvious.
+                //
+                // ALWAYS AVAILABLE, deliberately. An earlier version hid this
+                // until Run Untagged Materials had populated the tab, reasoning
+                // that nobody should commit fifty rows against figures they had
+                // not looked at. That guard protected nothing:
+                // create_untagged_material_allocation re-runs the untagged query
+                // server-side on every click and never reads the browser's copy,
+                // so the draft is built from live figures whether or not the tab
+                // was ever painted. All the gate achieved was hiding the entry
+                // from anyone who had not visited the tab first.
+
+                let $ua_btn = frm.add_custom_button(__("Allocate Untagged Materials"), function () {
+                    if (slot_blocked(slot_expired)) return;
+                    frappe.call({
+                        method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.create_untagged_material_allocation",
+                        args: { batch_planning_name: frm.doc.name },
+                        freeze: true,
+                        freeze_message: __("Sizing every item against the untagged pool..."),
+                        callback: function (r) {
+                            if (!r.message) return;
+
+                            // No skipped-items popup. The draft that opens is
+                            // itself the answer: the rows present are what can be
+                            // allocated, and an interstitial listing what is
+                            // absent made every click a two-step. The server
+                            // still returns r.message.warning, so it can be
+                            // surfaced somewhere non-blocking if it is wanted.
+                            frappe.model.with_doctype("Material Allocation", function () {
+                                let new_doc = frappe.model.get_new_doc("Material Allocation");
+                                new_doc.batch_planning = r.message.batch_planning;
+                                new_doc.employee_function = r.message.employee_function;
+                                new_doc.project_id = r.message.project_id;
+                                new_doc.project_name = r.message.project_name;
+                                new_doc.workflow_state = "Draft";
+
+                                (r.message.material_allocation || []).forEach(function (row) {
+                                    let child = frappe.model.add_child(new_doc, "material_allocation");
+                                    child.item_code = row.item_code;
+                                    child.item_name = row.item_name;
+                                    child.uom = row.uom;
+                                    child.quantity_required = row.quantity_required;
+                                    child.allocate_qty = row.allocate_qty;
+                                    child.stock_available = row.stock_available;
+                                    // The field that routes every downstream
+                                    // figure to the untagged pile. Drop it and
+                                    // these rows go through free_stock_figures
+                                    // instead, which measures stock they did
+                                    // not come from and would reject them.
+                                    child.source_pool = row.source_pool;
+                                    child.lab_allocated_qty = row.lab_allocated_qty;
+                                    child.main_allocated_qty = row.main_allocated_qty;
+                                    // Server-set wherever the pool covers less
+                                    // than the BOM quantity, which is the normal
+                                    // case here. validate makes Reason mandatory
+                                    // on any such row, so dropping it would block
+                                    // the save on a deviation the system chose.
+                                    child.reason = row.reason;
+                                });
+
+                                frappe.set_route("Form", "Material Allocation", new_doc.name);
+                            });
+                        }
+                    });
+                }, __("Create"));
+                if (slot_expired) mark_slot_expired($ua_btn);
 
                 let $mr_btn = frm.add_custom_button(__("Material Request"), function () {
                     if (slot_blocked(slot_expired)) return;
@@ -1662,6 +1789,574 @@ function render_bom_components_tab(frm) {
     });
 }
 
+// Untagged Materials — the same items as Material Planning, measured against
+// stock and pipeline that carry NO batch tag. Amber throughout rather than the
+// planning tab's green, so a screenshot of one is never mistaken for the other:
+// the two tabs show the same item codes with deliberately different numbers.
+// force=true fetches; anything else paints the payload already in hand.
+//
+// WHY THE SPLIT. refresh() fires on save, on workflow action and on every route
+// back to the form, and it re-entered this function each time. Once the button
+// had been pressed that meant a fresh 50-item round trip per refresh, each one
+// replacing the finished table with the spinner again — so a tab that renders
+// in about a second looked like it was hanging indefinitely. Only the button
+// fetches now; refresh() repaints from memory.
+//
+// An in-flight guard sits on top of that: double-clicking the button used to
+// start a second request whose spinner overwrote the first one's result.
+function render_untagged_materials_tab(frm, force) {
+    let $field = frm.fields_dict["untagged_material_html"];
+    if (!$field) return;
+
+    if (!force && frm._um_payload) {
+        paint_untagged_materials(frm, frm._um_payload);
+        return;
+    }
+    if (frm._um_loading) return;
+    frm._um_loading = true;
+
+    $field.$wrapper.html(`
+        <div style="padding:48px; text-align:center; color:#6b7280;">
+            <div style="width:36px; height:36px; border:3px solid #d1fae5; border-top-color:#16a34a; border-radius:50%; animation:um-spin-bp 0.8s linear infinite; margin:0 auto 14px;"></div>
+            <style>@keyframes um-spin-bp { to { transform:rotate(360deg); } }</style>
+            <div style="font-size:13px; color:#4b5563;">Fetching untagged stock and pipeline...</div>
+        </div>
+    `);
+
+    frappe.call({
+        method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_untagged_material_data",
+        args: { doc_name: frm.doc.name },
+        // Without this, ANY failure left the spinner turning forever with
+        // nothing said — the failure mode is indistinguishable from slowness,
+        // which is exactly how a broken call gets reported as "taking too long".
+        error: function (e) {
+            frm._um_loading = false;
+            let detail = (e && (e.message || (e.exc_type || ""))) || "";
+            $field.$wrapper.html(`
+                <div style="padding:40px; text-align:center; border:2px dashed #fecaca; border-radius:12px; background:#fef2f2;">
+                    <div style="font-size:32px; margin-bottom:10px;">⚠️</div>
+                    <div style="font-size:14px; font-weight:700; color:#991b1b; margin-bottom:6px;">Could not load untagged materials</div>
+                    <div style="font-size:12px; color:#7f1d1d;">${frappe.utils.escape_html(String(detail)) || "The request failed. Check the browser console and the Frappe error log."}</div>
+                    <div style="font-size:11px; color:#9ca3af; margin-top:10px;">Press <b>Run Untagged Materials</b> to try again.</div>
+                </div>
+            `);
+        },
+        callback: function (r) {
+            frm._um_loading = false;
+            if (!r.message) {
+                $field.$wrapper.html(empty_state("❌", "Could not fetch untagged material data."));
+                return;
+            }
+            frm._um_payload = r.message;
+            frm._um_data = r.message.results || [];
+            paint_untagged_materials(frm, r.message);
+        },
+    });
+}
+
+// Pure render: takes the payload, paints the tab, makes no server call. Split
+// out of render_untagged_materials_tab so a refresh can repaint instantly.
+function paint_untagged_materials(frm, message) {
+    let $field = frm.fields_dict["untagged_material_html"];
+    if (!$field) return;
+
+            let warehouse = message.warehouse;
+            let data = message.results || [];
+            let allocation_pending = !!message.allocation_pending;
+
+            if (!data.length) {
+                $field.$wrapper.html(empty_state("📦", "No BOM items to check against untagged stock."));
+                return;
+            }
+
+            let rows_html = data.map((row, i) => {
+                let bg = i % 2 === 0 ? "#f9fafb" : "#ffffff";
+
+                return `
+                    <tr style="background:${bg}; border-bottom: 1px solid #e5e7eb;">
+                        <td style="padding:9px 10px; text-align:center; color:#9ca3af; font-size:12px; font-weight:600;">${i + 1}</td>
+                        <td style="padding:9px 10px;"><span style="background:#16a34a; color:#fff; padding:2px 8px; border-radius:4px; font-size:10px; font-weight:700; white-space:nowrap;">${row.item_code}</span></td>
+                        <td style="padding:9px 10px; color:#1f2937; font-size:12px; font-weight:500;">${row.item_name || ""}</td>
+                        <td style="padding:9px 10px; text-align:center; color:#4b5563; font-size:12px; font-family:monospace;">${row.uom || ""}</td>
+                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#d97706; font-size:12px;">${format_qty_val(row.qty_required)}</td>
+                        <td style="padding:9px 10px; text-align:center; font-weight:700; color:#14532d; font-size:12px;">${format_qty_val(row.total_stock)}</td>
+                        <td style="padding:9px 10px; text-align:center; font-weight:700; font-size:12px;">${main_wh_line(row.main_stock, frm.doc.name, row.item_code)}</td>
+                        <!-- Lab Item sits beside Main Wh: the two are the physical
+                             split of this function's untagged holding, and reading
+                             them side by side is what makes Total Stock check out.
+
+                             ONE figure, not the Existing / After-Alloc pair the
+                             other stacked cells use. The second line was tried and
+                             removed twice for the same reason: on almost every row
+                             lab-sourced allocation moves nothing and main-sourced
+                             allocation is zero, so After Alloc equals Existing and
+                             the cell prints the same number twice, which reads as a
+                             display fault rather than as information.
+
+                             The backend still returns lab_after_alloc, and it is
+                             still the honest projection — lab_stock plus only the
+                             MAIN-sourced share, because lab-sourced units are
+                             already standing in the lab. Surface it somewhere it
+                             can differ, not here. -->
+                        <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+                            ${lab_item_line(row.lab_available, frm.doc.name, row.item_code)}
+                        </td>
+                        <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+                            <!-- MAIN-sourced only. The lab-sourced share is
+                                 reported under Labware; carrying it here too
+                                 read as double the reservation. What is left in
+                                 this column is the part still standing in the
+                                 store, waiting on a physical transfer - the only
+                                 part that is outstanding work. -->
+                            ${stock_line(row.global_main_allocated, "#16a34a")}
+                            ${stock_line(row.current_main_allocated, "#1d4ed8")}
+                        </td>
+                        <td style="padding:9px 10px; text-align:center; font-weight:700; font-size:12px;">${free_line(row.free_qty, "#15803d")}</td>
+                        <!-- Labware: the lab-sourced share of every untagged
+                             allocation on this pool. Its rise is the whole of
+                             the lab_item -> Labware move - Lab Item beside it
+                             falls by the same amount, and nothing else changes.
+
+                             There is no Labware warehouse and no stock movement
+                             behind this. Those units never left the lab
+                             warehouses they were already standing in; the column
+                             reports who has claimed them. -->
+                        <td style="padding:9px 10px; text-align:center; font-weight:700; font-size:12px;">
+                            ${stock_line(row.labware_qty, "#7c3aed")}
+                        </td>
+                        ${pipeline_cell_single(row, "mr", "Material Request")}
+                        ${pipeline_cell_single(row, "po", "Purchase Order")}
+                        ${pipeline_cell_single(row, "pr", "Purchase Receipt")}
+                        <td style="padding:9px 10px; text-align:center; font-weight:700; font-size:12px; color:${parseFloat(row.net_requirement || 0) > 0 ? "#dc2626" : "#15803d"};">${format_qty_val(row.net_requirement)}</td>
+                    </tr>`;
+            }).join("");
+
+            // Kept for the pre-allocation state only. The server now sends
+            // allocation_pending false, so this renders nothing — but the flag
+            // stays wired up rather than being deleted, because it is the one
+            // switch that distinguishes "nothing is reserved" from "nothing CAN
+            // be reserved", and conflating those is exactly what the note exists
+            // to prevent.
+            let pending_note = allocation_pending
+                ? `<div style="margin-top:8px; padding:8px 12px; background:#d1fae5; border:1px solid #86efac; border-radius:6px; font-size:11px; color:#14532d;">
+                       <b>Allocation not yet available for untagged stock.</b> Both Allocated lines read 0 because no reservation can be made against this pool yet — so Free Qty currently equals Main Wh, and Lab Wise (After Alloc) equals Lab Wise (Existing).
+                   </div>`
+                : "";
+
+            let html = `
+                <div id="um-table-container-bp" style="width:100%; font-family:inherit; margin-top: 15px;">
+                    <div style="background:linear-gradient(135deg, #16a34a 0%, #14532d 100%); color:#fff; padding:16px 20px; border-radius:10px 10px 0 0; display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <div style="font-size:15px; font-weight:700;">🏷️ Untagged Materials — Stock &amp; Pipeline With No Batch Tag</div>
+                            <div style="font-size:12px; opacity:0.85; margin-top:2px;">Warehouse: <b>${warehouse}</b></div>
+                        </div>
+                        <div style="background:rgba(255,255,255,0.15); padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600;">
+                            ${data.length} Items
+                        </div>
+                    </div>
+                    ${table_scroll_styles()}
+                    <div class="bp-scroll-wrap" style="border:1px solid #d1fae5; border-top:none; border-radius:0 0 10px 10px; background:#fff;">
+                        <table style="width:100%; border-collapse:collapse; min-width:1350px; text-align:left;">
+                            <thead>
+                                <tr style="background:#f3f4f6;">
+                                    <th style="${th_style()}">#</th>
+                                    <th style="${th_style("left")}">Item Code</th>
+                                    <th style="${th_style("left")}">Item Name</th>
+                                    <th style="${th_style()}">UOM</th>
+                                    <th style="${th_style()}">Qty Req</th>
+                                    <th style="${th_style()}">Total Stock</th>
+                                    <th style="${th_style()}">Main Wh</th>
+                                    <th style="${th_style()}">Lab Item</th>
+                                    <th style="${th_style()}">Allocated</th>
+                                    <th style="${th_style()}">Free Qty</th>
+                                    <th style="${th_style()}">Labware</th>
+                                    <th style="${th_style()}">Open MR</th>
+                                    <th style="${th_style()}">Open PO</th>
+                                    <th style="${th_style()}">Unapproved GRN</th>
+                                    <th style="${th_style()}">Net Req</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${rows_html}
+                            </tbody>
+                        </table>
+                    </div>
+                    ${pending_note}
+                </div>`;
+            $field.$wrapper.html(html);
+}
+
+// Amber to match the tab it fills, and gated the same way Material Planning's
+// placeholder is: slot_expired swaps the call to action for an explanation,
+// so a closed batch does not show "Click Run Untagged Materials above" beside
+// a button that will refuse.
+function render_untagged_materials_placeholder(frm, slot_expired) {
+    let $field = frm.fields_dict["untagged_material_html"];
+    if (!$field) return;
+
+    if (slot_expired) {
+        $field.$wrapper.html(`
+            <div style="padding:48px; text-align:center; color:#6b7280; border:2px dashed #e5e7eb; border-radius:12px; margin:4px 0; background:#f9fafb;">
+                <div style="font-size:36px; margin-bottom:12px;">🗓️</div>
+                <div style="font-size:15px; font-weight:700; color:#4b5563; margin-bottom:6px;">Slot Period Ended</div>
+                <div style="font-size:13px; color:#6b7280;">Untagged material review is closed for this batch — its slot period is over.</div>
+            </div>
+        `);
+        return;
+    }
+
+    $field.$wrapper.html(`
+        <div style="padding:48px; text-align:center; color:#6b7280; border:2px dashed #d1fae5; border-radius:12px; margin:4px 0; background:#f9fafb;">
+            <div style="font-size:36px; margin-bottom:12px;">🏷️</div>
+            <div style="font-size:15px; font-weight:700; color:#14532d; margin-bottom:6px;">Untagged Materials</div>
+            <div style="font-size:13px; color:#4b5563;">Click <b style="color:#16a34a;">Run Untagged Materials</b> above to load stock and pipeline carrying no batch tag.</div>
+        </div>
+    `);
+}
+
+// ---------------------------------------------------------------------------
+// Shared table cell renderers.
+//
+// These were local to render_material_planning_tab's callback until the
+// Untagged Materials tab needed the identical formatting. Lifted rather than
+// copied deliberately: two divergent copies of the same quantity calculation is
+// exactly how the Qty Req scale bug happened, and the same trap applies to the
+// number FORMATTING that decides whether a figure reads as "0", "-" or
+// "pending".
+//
+// Pure functions of their arguments — no frm, no closure state — so both tabs
+// get identical output for identical input, which is the property being
+// protected.
+// ---------------------------------------------------------------------------
+
+const PENDING_HINT = "Pending until the stock cutover go-live marker is set in Batch Planning Settings.";
+
+const GRN_SECTIONS = {
+    gen: "Global Unapproved GRN — receipts tagged to the GLOBAL BATCH (other Batch Plannings), waiting on Store Head approval.",
+    bp: "Local Unapproved GRN — receipts tagged to the CURRENT BATCH, waiting on Store Head approval.",
+};
+
+// Header cells are sticky, so they need their OWN background: a sticky <th>
+// paints over scrolled rows, and the colour set on the parent <tr> does not
+// travel with it — without this the row text shows straight through the header.
+// The bottom rule is a box-shadow rather than a border for the same reason;
+// borders on sticky cells detach and scroll away in Chrome.
+function th_style(align = "center") {
+    return `padding:11px 10px; text-align:${align}; color:#166534; font-weight:700; font-size:10px; text-transform:uppercase; white-space:nowrap; background:#f3f4f6; position:sticky; top:0; z-index:3; box-shadow: inset 0 -2px 0 #86efac;`;
+}
+
+// Scroll shell shared by both data tables. Injected per table rather than once
+// globally because each tab renders independently and neither can rely on the
+// other having run first; duplicate identical rules are harmless.
+//
+// overflow-x is `scroll`, not `auto`, deliberately — on Windows the auto
+// scrollbar stays hidden until a scroll gesture starts, so a table wider than
+// its container gives no visual hint that there are more columns off to the
+// right. Forcing the track to render is the whole point.
+function table_scroll_styles() {
+    return `
+        <style>
+            .bp-scroll-wrap {
+                overflow-x: scroll;
+                overflow-y: auto;
+                max-height: 70vh;
+                scrollbar-width: auto;
+                scrollbar-color: #94a3b8 #f1f5f9;
+            }
+            .bp-scroll-wrap::-webkit-scrollbar { height: 12px; width: 12px; }
+            .bp-scroll-wrap::-webkit-scrollbar-track {
+                background: #f1f5f9;
+                border-radius: 6px;
+            }
+            .bp-scroll-wrap::-webkit-scrollbar-thumb {
+                background: #94a3b8;
+                border-radius: 6px;
+                border: 2px solid #f1f5f9;
+            }
+            .bp-scroll-wrap::-webkit-scrollbar-thumb:hover { background: #64748b; }
+            .bp-scroll-wrap::-webkit-scrollbar-corner { background: #f1f5f9; }
+        </style>
+    `;
+}
+
+function format_qty_val(val) {
+    if (val === null || val === undefined || val === "") return "-";
+    let num = parseFloat(val);
+    if (isNaN(num)) return "-";
+    return num % 1 === 0 ? num.toString() : num.toFixed(2);
+}
+
+function pipeline_line(qty, count, docs, doctype, color, label) {
+    let title = label ? ` title="${label}"` : "";
+    let n = parseFloat(qty || 0);
+    let c = parseInt(count || 0);
+    if (!(n > 0)) {
+        return `<div style="color:#d1d5db; line-height:1.6;"${title}>0 (0)</div>`;
+    }
+    let docs_json = JSON.stringify(docs || []).replace(/"/g, '&quot;');
+    return `<div style="line-height:1.6;"${title}><span style="color:${color}; cursor:pointer; border-bottom:1px dotted ${color};"
+        onclick="event.stopPropagation(); frappe.set_route('List', '${doctype}', {'name': ['in', ${docs_json}]})"
+        >${format_qty_val(n)} (${c})</span></div>`;
+}
+
+// Two stacked lines, keyed gen_<stage>_* over bp_<stage>_*.
+function pipeline_cell(row, stage, doctype, labels) {
+    labels = labels || {};
+    return `
+        <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+            ${pipeline_line(row["gen_" + stage + "_qty"], row["gen_" + stage + "_count"], row["gen_" + stage + "_docs"], doctype, "#16a34a", labels.gen)}
+            ${pipeline_line(row["bp_" + stage + "_qty"], row["bp_" + stage + "_count"], row["bp_" + stage + "_docs"], doctype, "#1d4ed8", labels.bp)}
+        </td>
+    `;
+}
+
+// Single-line variant for the Untagged tab, which has one pool and so one
+// figure per pipeline stage rather than a Global/Current pair.
+function pipeline_cell_single(row, stage, doctype, color) {
+    return `
+        <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+            ${pipeline_line(row[stage + "_qty"], row[stage + "_count"], row[stage + "_docs"], doctype, color || "#16a34a")}
+        </td>
+    `;
+}
+
+function stock_line(qty, color, pending_title) {
+    if (qty === null || qty === undefined) {
+        return `<div style="color:#9ca3af; font-style:italic; line-height:1.6;" title="${pending_title || ""}">pending</div>`;
+    }
+    let n = parseFloat(qty || 0);
+    if (n <= 0) {
+        return `<div style="color:#d1d5db; line-height:1.6;">0</div>`;
+    }
+    return `<div style="color:${color}; line-height:1.6;">${format_qty_val(n)}</div>`;
+}
+
+function stock_cell(global_qty, bp_qty) {
+    return `
+        <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
+            ${stock_line(global_qty, "#16a34a", PENDING_HINT)}
+            ${stock_line(bp_qty, "#1d4ed8")}
+        </td>
+    `;
+}
+
+// Shared layout for both drill-down dialogs.
+//
+// A responsive tile GRID, not a vertical table: five lab warehouses stacked as
+// table rows produced a tall, narrow dialog that used almost none of the width
+// available to it. auto-fit + minmax spends the width instead and reflows on
+// its own as the dialog or viewport changes — no breakpoints, no media queries,
+// and it behaves the same for three tiles or thirty.
+//
+// Zero tiles are kept but drained of colour. "Checked, holds nothing" and "not
+// looked at" are different statements, and only the first is useful when the
+// point of the panel is to verify a sum.
+// Plain two-column list: label left, quantity right-aligned, reconciliation
+// totals as footer rows in the SAME table so they line up under the figures they
+// sum.
+//
+// Replaced a card grid. Five lab warehouses became five tiles across a row, the
+// zero ones were as visually loud as the live ones, and the total sat in a
+// separate bar well away from the numbers it was supposed to reconcile — which
+// is the one job this drill-down has.
+//
+// Uses Frappe's own table classes rather than inline styling, so it follows the
+// desk theme. The only inline style is the horizontal scroll wrapper, which
+// keeps long warehouse names from widening the dialog.
+function breakdown_list(rows, opts) {
+    opts = opts || {};
+    let esc = frappe.utils.escape_html;
+
+    // Second label column, used by the Main Wh drill-down to carry the project
+    // name beside its id. Omitted entirely when nothing supplies one, so the lab
+    // drill-down stays two columns rather than growing an empty third.
+    let has_sub = !!opts.sublabel;
+    let cols = has_sub ? 3 : 2;
+
+    // Green, matching the Material Planning palette the tab now uses. Confined
+    // to the header and total rows: the body stays plain so the figures are what
+    // the eye lands on.
+    let head_bg = "background:#d1fae5; color:#14532d;";
+
+    let body = (rows || []).map(function (r) {
+        return `
+            <tr>
+                <td>${esc(r.label)}</td>
+                ${has_sub ? `<td>${esc(r.sublabel || "")}</td>` : ""}
+                <td class="text-right">${format_qty_val(r.qty)}</td>
+            </tr>`;
+    }).join("");
+
+    let foot = (opts.totals || []).map(function (t) {
+        return `
+            <tr style="${head_bg}">
+                <th${has_sub ? ' colspan="2"' : ""}>${esc(t.label)}</th>
+                <th class="text-right">${format_qty_val(t.qty)}</th>
+            </tr>`;
+    }).join("");
+
+    return `
+        <div style="overflow-x:auto;">
+            <table class="table table-bordered" style="min-width:${has_sub ? 460 : 320}px; margin-bottom:0;">
+                <thead>
+                    <tr style="${head_bg}">
+                        <th>${esc(opts.label || "Warehouse")}</th>
+                        ${has_sub ? `<th>${esc(opts.sublabel)}</th>` : ""}
+                        <th class="text-right">Qty</th>
+                    </tr>
+                </thead>
+                <tbody>${body || `<tr><td colspan="${cols}" class="text-muted">${esc(opts.empty || "No rows.")}</td></tr>`}</tbody>
+                ${foot ? `<tfoot>${foot}</tfoot>` : ""}
+            </table>
+        </div>`;
+}
+
+// Lab Item drill-down. Global because the table is built as an HTML string and
+// its onclick handlers are inline, so there is no closure to reach into.
+//
+// A DIALOG rather than a route to Stock Ledger or Bin, deliberately: neither of
+// those reports can filter on batch_planning_id, so both would show tagged and
+// untagged stock together and contradict the very figure this is explaining.
+// The dialog calls the same _stock_qty path the row total came from, so the
+// parts always add up to the whole.
+window.cbp_show_lab_breakdown = function (doc_name, item_code) {
+    frappe.call({
+        method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_untagged_lab_breakdown",
+        args: { doc_name: doc_name, item_code: item_code },
+        freeze: true,
+        freeze_message: __("Reading lab warehouses..."),
+        callback: function (r) {
+            if (!r.message) return;
+            let d = r.message;
+            let rows = d.rows || [];
+
+            if (!rows.length) {
+                frappe.msgprint({
+                    title: __("No Lab Warehouses"),
+                    message: __("Employee Function <b>{0}</b> declares no lab warehouses, so Lab Item is 0 by definition.", [d.employee_function]),
+                    indicator: "orange",
+                });
+                return;
+            }
+
+            let dlg = new frappe.ui.Dialog({
+                title: __("Lab Item breakdown — {0}", [item_code]),
+                size: "large",
+                fields: [{ fieldtype: "HTML", fieldname: "breakdown" }],
+                primary_action_label: __("Close"),
+                primary_action: function () { dlg.hide(); },
+            });
+
+            dlg.fields_dict.breakdown.$wrapper.html(`
+                ${breakdown_list(
+                    rows.map(function (row) {
+                        return { label: row.warehouse, qty: row.qty };
+                    }),
+                    {
+                        label: "Lab Warehouse",
+                        empty: "This function declares no lab warehouses.",
+                        totals: (parseFloat(d.allocated) || 0) > 0
+                            ? [
+                                { label: "Gross untagged lab stock", qty: d.total },
+                                { label: "Less allocated — shown as Labware", qty: d.allocated },
+                                { label: "Available — matches Lab Item on the row", qty: d.available },
+                              ]
+                            : [{ label: "Total — matches Lab Item on the row", qty: d.total }],
+                    }
+                )}
+            `);
+            dlg.show();
+        },
+    });
+};
+
+// Lab Item's own line: same dotted-underline affordance as pipeline_line, so a
+// drillable number looks drillable wherever it appears.
+function lab_item_line(qty, doc_name, item_code) {
+    let n = parseFloat(qty || 0);
+    let color = n > 0 ? "#7c3aed" : "#d1d5db";
+    return `<div style="line-height:1.6;"><span style="color:${color}; cursor:pointer; border-bottom:1px dotted ${color};"
+        title="Show the per-warehouse split behind this figure"
+        onclick="event.stopPropagation(); window.cbp_show_lab_breakdown('${doc_name}', '${item_code}')"
+        >${format_qty_val(n)}</span></div>`;
+}
+
+function main_wh_line(qty, doc_name, item_code) {
+    let n = parseFloat(qty || 0);
+    let color = n > 0 ? "#14532d" : "#d1d5db";
+    return `<span style="color:${color}; cursor:pointer; border-bottom:1px dotted ${color};"
+        title="Show this item project-wise, and which other Employee Functions hold it"
+        onclick="event.stopPropagation(); window.cbp_show_main_breakdown('${doc_name}', '${item_code}')"
+        >${format_qty_val(n)}</span>`;
+}
+
+// Main Wh drill-down: this function's store stock split by Project, plus the
+// same item in other functions' stores as context.
+//
+// The two sections are kept apart on purpose. The first totals to the Main Wh
+// figure on the row and is the reconciliation; the second is other people's
+// stock and must never be added to it, or the drill-down would contradict the
+// number it exists to explain.
+window.cbp_show_main_breakdown = function (doc_name, item_code) {
+    frappe.call({
+        method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_untagged_main_breakdown",
+        args: { doc_name: doc_name, item_code: item_code },
+        freeze: true,
+        freeze_message: __("Reading store stock by project..."),
+        callback: function (r) {
+            if (!r.message) return;
+            let d = r.message;
+            let esc = frappe.utils.escape_html;
+
+            let rows = d.this_ef || [];
+
+            let dlg = new frappe.ui.Dialog({
+                title: __("Main Wh breakdown — {0}", [item_code]),
+                size: "large",
+                fields: [{ fieldtype: "HTML", fieldname: "breakdown" }],
+                primary_action_label: __("Close"),
+                primary_action: function () { dlg.hide(); },
+            });
+
+            let grid = breakdown_list(
+                rows.map(function (row) {
+                    return {
+                        label: row.project_id,
+                        sublabel: row.project_name,
+                        qty: row.qty,
+                    };
+                }),
+                {
+                    label: "Project ID",
+                    sublabel: "Project Name",
+                    empty: "No untagged stock in this store.",
+                    totals: [{ label: "Total — matches Main Wh on the row", qty: d.this_ef_total }],
+                }
+            );
+
+            // The explanatory paragraph is gone and the table takes the space.
+            // It said the same thing on every open, repeated the warehouse
+            // already in the dialog title, and printed the Employee Function
+            // twice over on this site because the function is named after its
+            // own store. The exclusion it described - batch-tagged units are not
+            // counted - is the defining property of the whole tab, stated in its
+            // header, not something this dialog needs to restate.
+            dlg.fields_dict.breakdown.$wrapper.html(grid);
+            dlg.show();
+        },
+    });
+};
+
+function free_line(qty, color) {
+    if (qty === null || qty === undefined) {
+        return `<div style="color:#9ca3af; font-style:italic; line-height:1.6;" title="${PENDING_HINT}">pending</div>`;
+    }
+    let n = parseFloat(qty || 0);
+    let shown = n < 0 ? 0 : n;
+    let title = n < 0 ? `Actual: ${format_qty_val(n)} — more is reserved than this scope's stock covers.` : "";
+    return `<div style="color:${shown > 0 ? color : "#dc2626"}; line-height:1.6;" title="${title}">${format_qty_val(shown)}</div>`;
+}
+
 function render_material_planning_tab(frm) {
     let $field = frm.fields_dict["material_planning_html"];
     if (!$field) return;
@@ -1693,78 +2388,6 @@ function render_material_planning_tab(frm) {
                 return;
             }
 
-            let th_style = function (align = "center") {
-                return `padding:11px 10px; text-align:${align}; color:#166534; font-weight:700; font-size:10px; text-transform:uppercase; white-space:nowrap; border-bottom:2px solid #86efac;`;
-            };
-
-            let format_qty_val = function (val) {
-                if (val === null || val === undefined || val === "") return "-";
-                let num = parseFloat(val);
-                if (isNaN(num)) return "-";
-                return num % 1 === 0 ? num.toString() : num.toFixed(2);
-            };
-
-            let pipeline_line = function (qty, count, docs, doctype, color, label) {
-                let title = label ? ` title="${label}"` : "";
-                let n = parseFloat(qty || 0);
-                let c = parseInt(count || 0);
-                if (!(n > 0)) {
-                    return `<div style="color:#d1d5db; line-height:1.6;"${title}>0 (0)</div>`;
-                }
-                let docs_json = JSON.stringify(docs || []).replace(/"/g, '&quot;');
-                return `<div style="line-height:1.6;"${title}><span style="color:${color}; cursor:pointer; border-bottom:1px dotted ${color};"
-                    onclick="event.stopPropagation(); frappe.set_route('List', '${doctype}', {'name': ['in', ${docs_json}]})"
-                    >${format_qty_val(n)} (${c})</span></div>`;
-            };
-
-            let pipeline_cell = function (row, stage, doctype, labels) {
-                labels = labels || {};
-                return `
-                    <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
-                        ${pipeline_line(row["gen_" + stage + "_qty"], row["gen_" + stage + "_count"], row["gen_" + stage + "_docs"], doctype, "#16a34a", labels.gen)}
-                        ${pipeline_line(row["bp_" + stage + "_qty"], row["bp_" + stage + "_count"], row["bp_" + stage + "_docs"], doctype, "#1d4ed8", labels.bp)}
-                    </td>
-                `;
-            };
-
-            let GRN_SECTIONS = {
-                gen: "Global Unapproved GRN — receipts tagged to the GLOBAL BATCH (other Batch Plannings), waiting on Store Head approval.",
-                bp: "Local Unapproved GRN — receipts tagged to the CURRENT BATCH, waiting on Store Head approval.",
-            };
-
-            let stock_line = function (qty, color, pending_title) {
-                if (qty === null || qty === undefined) {
-                    return `<div style="color:#9ca3af; font-style:italic; line-height:1.6;" title="${pending_title || ""}">pending</div>`;
-                }
-                let n = parseFloat(qty || 0);
-                if (n <= 0) {
-                    return `<div style="color:#d1d5db; line-height:1.6;">0</div>`;
-                }
-                return `<div style="color:${color}; line-height:1.6;">${format_qty_val(n)}</div>`;
-            };
-
-            let PENDING_HINT = "Pending until the stock cutover go-live marker is set in Batch Planning Settings.";
-
-            let stock_cell = function (global_qty, bp_qty) {
-                return `
-                    <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
-                        ${stock_line(global_qty, "#16a34a", PENDING_HINT)}
-                        ${stock_line(bp_qty, "#1d4ed8")}
-                    </td>
-                `;
-            };
-
-
-            let free_line = function (qty, color) {
-                if (qty === null || qty === undefined) {
-                    return `<div style="color:#9ca3af; font-style:italic; line-height:1.6;" title="${PENDING_HINT}">pending</div>`;
-                }
-                let n = parseFloat(qty || 0);
-                let shown = n < 0 ? 0 : n;
-                let title = n < 0 ? `Actual: ${format_qty_val(n)} — more is reserved than this scope's stock covers.` : "";
-                return `<div style="color:${shown > 0 ? color : "#dc2626"}; line-height:1.6;" title="${title}">${format_qty_val(shown)}</div>`;
-            };
-
             let rows_html = data.map((row, i) => {
                 let bg = i % 2 === 0 ? "#f9fafb" : "#ffffff";
 
@@ -1781,8 +2404,20 @@ function render_material_planning_tab(frm) {
                         <td style="padding:9px 10px; text-align:center; font-weight:700; color:#d97706; font-size:12px;">${format_qty_val(row.qty_required)}</td>
                         ${stock_cell(row.gen_total_stock, row.bp_total_stock)}
                         ${stock_cell(row.gen_main_stock, row.bp_main_stock)}
+                        <!-- Global (top) is pool-side: everything reserved OUT OF
+                             the global pile, including this batch's own borrowing.
+                             That is what makes the top line reconcile across the
+                             row — Global Main - Global Allocated = Global Free.
+
+                             Current (bottom) is batch-side: everything THIS batch
+                             reserved, local and borrowed together. The same
+                             reconciliation deliberately does NOT hold here, and
+                             cannot: borrowed units are counted in Allocated but
+                             live in the other batches' pile, not in this batch's
+                             Main Wh. See free_stock_figures for the invariant that
+                             does hold on this line. -->
                         <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
-                            <div style="line-height:1.6; color:#e5e7eb;">·</div>
+                            ${stock_line(row.global_allocated, "#16a34a")}
                             ${stock_line(row.allocated_qty, "#1d4ed8")}
                         </td>
                         <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
@@ -1826,7 +2461,8 @@ function render_material_planning_tab(frm) {
                             ${data.length} Items
                         </div>
                     </div>
-                    <div style="overflow-x:auto; border:1px solid #d1fae5; border-top:none; border-radius:0 0 10px 10px; background:#fff;">
+                    ${table_scroll_styles()}
+                    <div class="bp-scroll-wrap" style="border:1px solid #d1fae5; border-top:none; border-radius:0 0 10px 10px; background:#fff;">
                         <table style="width:100%; border-collapse:collapse; min-width:1350px; text-align:left;">
                             <thead>
                                 <tr style="background:#f3f4f6;">
@@ -1859,9 +2495,23 @@ function render_material_planning_tab(frm) {
     });
 }
 
-function render_material_planning_placeholder(frm) {
+// slot_expired swaps the call to action for an explanation. Without it an
+// expired batch showed "Click Run Material Planning above" beside a greyed-out
+// button, which reads as a broken form rather than a closed slot.
+function render_material_planning_placeholder(frm, slot_expired) {
     let $field = frm.fields_dict["material_planning_html"];
     if (!$field) return;
+
+    if (slot_expired) {
+        $field.$wrapper.html(`
+            <div style="padding:48px; text-align:center; color:#6b7280; border:2px dashed #e5e7eb; border-radius:12px; margin:4px 0; background:#f9fafb;">
+                <div style="font-size:36px; margin-bottom:12px;">🗓️</div>
+                <div style="font-size:15px; font-weight:700; color:#4b5563; margin-bottom:6px;">Slot Period Ended</div>
+                <div style="font-size:13px; color:#6b7280;">Material planning is closed for this batch — its slot period is over, so any figures would describe a period that has already passed.</div>
+            </div>
+        `);
+        return;
+    }
 
     $field.$wrapper.html(`
         <div style="padding:48px; text-align:center; color:#6b7280; border:2px dashed #d1fae5; border-radius:12px; margin:4px 0; background:#f0fdf4;">

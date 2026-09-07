@@ -259,6 +259,7 @@ fixtures = [
                 "custom_batch_planning",
                 "custom_enable_manufacturing_batch",
                 "custom_batch_planning_no",
+                "custom_material_allocation",
                 "batch_planning_id"
             ]]
         ]
@@ -297,7 +298,11 @@ doc_events = {
         "validate": [
             "custom_batch_planning.api.pr_integration.validate_material_request",
             "custom_batch_planning.api.tagging_enforcement.validate_tagging",
-        ]
+        ],
+        # after_insert, not validate: the request only has a name once it is
+        # inserted, and that name is the whole point of the stamp. Running it
+        # on every save would also rewrite the link on each edit for no gain.
+        "after_insert": "custom_batch_planning.api.ma_link.stamp_material_allocation",
     },
     "Purchase Order": {
         "validate": [

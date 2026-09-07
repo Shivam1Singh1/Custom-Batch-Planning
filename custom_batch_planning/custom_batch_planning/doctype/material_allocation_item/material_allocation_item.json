@@ -20,6 +20,9 @@
   "allocate_qty",
   "local_allocated_qty",
   "global_allocated_qty",
+  "source_pool",
+  "lab_allocated_qty",
+  "main_allocated_qty",
   "qty_allocated",
   "shortage",
   "reason"
@@ -118,6 +121,31 @@
    "read_only": 1
   },
   {
+   "default": "Tagged",
+   "description": "Which pool this row draws on. Tagged = batch-tagged stock (the pools free_stock_figures measures). Untagged = stock carrying no batch_planning_id, split across lab_allocated_qty and main_allocated_qty.",
+   "fieldname": "source_pool",
+   "fieldtype": "Select",
+   "label": "Source Pool",
+   "options": "Tagged\nUntagged",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "description": "Untagged rows only. Portion taken from stock already sitting in the lab warehouses. Symbolic \u2014 no ledger movement ever posts for it.",
+   "fieldname": "lab_allocated_qty",
+   "fieldtype": "Float",
+   "label": "From Untagged Lab",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "description": "Untagged rows only. Portion reserved out of the main store; moves physically later via the MR -> Stock Entry transfer.",
+   "fieldname": "main_allocated_qty",
+   "fieldtype": "Float",
+   "label": "From Untagged Main",
+   "read_only": 1
+  },
+  {
    "allow_on_submit": 1,
    "fieldname": "qty_allocated",
    "fieldtype": "Float",
@@ -142,7 +170,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-08-24 14:00:00.000000",
+ "modified": "2026-09-07 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Custom Batch Planning",
  "name": "Material Allocation Item",

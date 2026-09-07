@@ -1,144 +1,174 @@
 {
-  "actions": [],
-  "allow_rename": 1,
-  "creation": "2026-03-18 11:38:01.559991",
-  "doctype": "DocType",
-  "engine": "InnoDB",
-  "field_order": [
-    "section_break_06dv",
-    "employee_function",
-    "function_head_name",
-    "project_id",
-    "project_name",
-    "allocation_status",
-    "mr_created",
-    "amended_from",
-    "batch_planning",
-    "stock_entry",
-    "material_allocation_table_section",
-    "material_allocation"
-  ],
-  "fields": [
-    {
-      "fieldname": "section_break_06dv",
-      "fieldtype": "Section Break"
-    },
-    {
-      "fieldname": "employee_function",
-      "fieldtype": "Link",
-      "in_list_view": 1,
-      "label": "Employee Function",
-      "options": "Employee Function",
-      "reqd": 1
-    },
-    {
-      "fetch_from": "employee_function.function_head_name",
-      "fieldname": "function_head_name",
-      "fieldtype": "Data",
-      "label": "Function Head Name",
-      "read_only": 1
-    },
-    {
-      "fieldname": "project_id",
-      "fieldtype": "Link",
-      "hidden": 1,
-      "label": "Project ID",
-      "options": "Project",
-      "read_only": 1
-    },
-    {
-      "fieldname": "project_name",
-      "fieldtype": "Data",
-      "label": "Project Name",
-      "read_only": 1
-    },
-    {
-      "allow_on_submit": 1,
-      "fieldname": "allocation_status",
-      "fieldtype": "Select",
-      "in_list_view": 1,
-      "in_standard_filter": 1,
-      "label": "Allocation Status",
-      "options": "\nAllocated\nDeallocated\nStock Entry Done",
-      "read_only": 1
-    },
-    {
-      "fieldname": "amended_from",
-      "fieldtype": "Link",
-      "label": "Amended From",
-      "no_copy": 1,
-      "options": "Material Allocation",
-      "print_hide": 1,
-      "read_only": 1,
-      "search_index": 1
-    },
-    {
-      "fieldname": "batch_planning",
-      "fieldtype": "Link",
-      "in_list_view": 1,
-      "label": "Planned Batch",
-      "options": "Batch Planning",
-      "reqd": 1
-    },
-    {
-      "allow_on_submit": 1,
-      "default": "0",
-      "fieldname": "mr_created",
-      "fieldtype": "Check",
-      "hidden": 1,
-      "label": "MR Created",
-      "read_only": 1
-    },
-    {
-      "allow_on_submit": 1,
-      "fieldname": "stock_entry",
-      "fieldtype": "Link",
-      "label": "Stock Entry",
-      "no_copy": 1,
-      "options": "Stock Entry",
-      "read_only": 1,
-      "search_index": 1
-    },
-    {
-      "fieldname": "material_allocation_table_section",
-      "fieldtype": "Section Break",
-      "label": "Material Allocation Table"
-    },
-    {
-      "fieldname": "material_allocation",
-      "fieldtype": "Table",
-      "label": "Material Allocation",
-      "options": "Material Allocation Item"
-    }
-  ],
-  "grid_page_length": 50,
-  "index_web_pages_for_search": 1,
-  "is_submittable": 1,
-  "links": [],
-  "modified": "2026-08-24 12:00:00.000000",
-  "modified_by": "Administrator",
-  "module": "Custom Batch Planning",
-  "name": "Material Allocation",
-  "naming_rule": "Expression (old style)",
-  "owner": "Administrator",
-  "permissions": [
-    {
-      "create": 1,
-      "delete": 1,
-      "email": 1,
-      "export": 1,
-      "print": 1,
-      "read": 1,
-      "report": 1,
-      "role": "System Manager",
-      "share": 1,
-      "submit": 1,
-      "write": 1
-    }
-  ],
-  "row_format": "Dynamic",
-  "rows_threshold_for_grid_search": 20,
-  "sort_field": "modified",
-  "sort_order": "DESC",
-  "states": []
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2026-03-18 11:38:01.559991",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_break_06dv",
+  "employee_function",
+  "function_head_name",
+  "project_id",
+  "project_name",
+  "allocation_status",
+  "has_untagged_items",
+  "requires_material_request",
+  "mr_created",
+  "amended_from",
+  "batch_planning",
+  "material_request",
+  "stock_entry",
+  "material_allocation_table_section",
+  "material_allocation"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_break_06dv",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "employee_function",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Employee Function",
+   "options": "Employee Function",
+   "reqd": 1
+  },
+  {
+   "fetch_from": "employee_function.function_head_name",
+   "fieldname": "function_head_name",
+   "fieldtype": "Data",
+   "label": "Function Head Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "project_id",
+   "fieldtype": "Link",
+   "hidden": 1,
+   "label": "Project ID",
+   "options": "Project",
+   "read_only": 1
+  },
+  {
+   "fieldname": "project_name",
+   "fieldtype": "Data",
+   "label": "Project Name",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "allocation_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Allocation Status",
+   "options": "\nAllocated\nDeallocated\nStock Entry Done",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "Set automatically. 1 when any row draws on the untagged pool.",
+   "fieldname": "has_untagged_items",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Has Untagged Items",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "Set automatically. 1 when some quantity still has to move physically: tagged rows in full, plus the main-sourced share of untagged rows. Lab-sourced quantity never moves.",
+   "fieldname": "requires_material_request",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Requires Material Request",
+   "read_only": 1
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "Material Allocation",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "batch_planning",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Planned Batch",
+   "options": "Batch Planning",
+   "reqd": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "default": "0",
+   "fieldname": "mr_created",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "MR Created",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "material_request",
+   "fieldtype": "Link",
+   "label": "Material Request",
+   "no_copy": 1,
+   "options": "Material Request",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "stock_entry",
+   "fieldtype": "Link",
+   "label": "Stock Entry",
+   "no_copy": 1,
+   "options": "Stock Entry",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "material_allocation_table_section",
+   "fieldtype": "Section Break",
+   "label": "Material Allocation Table"
+  },
+  {
+   "fieldname": "material_allocation",
+   "fieldtype": "Table",
+   "label": "Material Allocation",
+   "options": "Material Allocation Item"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2026-09-07 14:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "Custom Batch Planning",
+ "name": "Material Allocation",
+ "naming_rule": "Expression (old style)",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
 }

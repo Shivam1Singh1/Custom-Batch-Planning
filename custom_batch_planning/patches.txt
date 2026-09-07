@@ -3,4 +3,19 @@
 # Read docs to understand patches: https://frappeframework.com/docs/v14/user/en/database-migrations
 
 [post_model_sync]
-# Patches added in this section will be executed after doctypes are migratedcustom_batch_planning.patches.rename_booked_slots.execute
+# Patches added in this section will be executed after doctypes are migrated
+#
+# Entries are MODULE paths only. frappe appends ".execute" itself
+# (frappe/modules/patch_handler.py :: execute_patch builds
+# f"{patchmodule}.execute"), so a trailing ".execute" here resolves to
+# "<patch>.execute.execute" and migrate dies with:
+#   ModuleNotFoundError: No module named '<patch>.execute'; '<patch>' is not a package
+#
+# rename_booked_slots is deliberately NOT enabled. It was glued onto the end of
+# the comment line above, so it has never run. `Slot Booking CT` currently has
+# BOTH `booked_slots` and `planning_capacity` columns, which means the patch's
+# `has_column("booked_slots")` guard is true and rename_field would copy the
+# stale booked_slots values over planning_capacity and drop the old column.
+# Re-enable only after confirming which of the two columns holds the live data.
+# custom_batch_planning.patches.rename_booked_slots
+custom_batch_planning.patches.add_material_allocation_link_to_mr

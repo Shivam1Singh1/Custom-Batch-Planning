@@ -85,12 +85,15 @@ class TestUnapprovedGRN(unittest.TestCase):
         checked = 0
         for name in names:
             for row in get_material_planning_data(name)["results"]:
+                # local_allocated_qty is deliberately absent: those units are
+                # already inside bp_total_stock, and subtracting them again was
+                # the double-credit this formula was corrected to remove. Only
+                # the borrowed (global) draw needs crediting, because it sits
+                # outside this batch's own stock.
                 expected = max(
                     row["qty_required"]
-                    - row["bp_main_stock"]
-                    - row["lab_stock"]
+                    - row["bp_total_stock"]
                     - row["global_allocated_qty"]
-                    - row["local_allocated_qty"]
                     - row["bp_mr_qty"]
                     - row["bp_po_qty"],
                     0.0,

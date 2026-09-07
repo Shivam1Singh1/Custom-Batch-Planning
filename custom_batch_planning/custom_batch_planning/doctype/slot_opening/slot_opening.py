@@ -72,26 +72,36 @@ def get_slot_opening_usage(slot_opening=None):
     if not bookings:
         return []
 
-    used = dict(
-        frappe.db.sql(
-            """
-            SELECT bp.slot_booking_date, COUNT(*)
-            FROM `tabBatches Planned` bp
-            INNER JOIN `tabBatch Planning` p ON p.name = bp.batch_planning
-            WHERE p.slot_opening = %(so)s
-              AND bp.docstatus <> 2
-              AND p.docstatus <> 2
-            GROUP BY bp.slot_booking_date
-            """,
-            {"so": slot_opening},
+    # Keyed on str(date), not the raw value, because the two sides of this
+    # comparison are different types. Slot Booking CT.slot_booking_date is a
+    # Date, so it arrives as datetime.date; Batches Planned.slot_booking_date
+    # is a Data field holding 'YYYY-MM-DD', so it arrives as str. A dict keyed
+    # on the raw values never matched: planned stayed 0 for every date,
+    # remaining always came back equal to booked, and the Create Batch button
+    # stayed on screen no matter how much of the opening had been planned.
+    used = {
+        str(date): int(count or 0)
+        for date, count in (
+            frappe.db.sql(
+                """
+                SELECT bp.slot_booking_date, COUNT(*)
+                FROM `tabBatches Planned` bp
+                INNER JOIN `tabBatch Planning` p ON p.name = bp.batch_planning
+                WHERE p.slot_opening = %(so)s
+                  AND bp.docstatus <> 2
+                  AND p.docstatus <> 2
+                GROUP BY bp.slot_booking_date
+                """,
+                {"so": slot_opening},
+            )
+            or []
         )
-        or []
-    )
+    }
 
     out = []
     for row in bookings:
         booked = int(row.booked or 0)
-        planned = int(used.get(row.date, 0) or 0)
+        planned = used.get(str(row.date), 0)
         out.append({
             "date": str(row.date),
             "booked": booked,

@@ -218,6 +218,18 @@ frappe.ui.form.on("Material Allocation", {
 
         frm.clear_custom_buttons();
 
+        // The field is redundant on the form: Frappe already prints the same
+        // value as the status badge beside the title, and the workflow's own
+        // action buttons are what change it. Two copies of one value invited
+        // the reading that the field could be edited.
+        //
+        // Hidden on the FORM only, deliberately. The value still drives the
+        // Allocate and Material Request gating below, still filters the
+        // batch_planning query, and is untouched in the list view and reports.
+        // Setting hidden on the Custom Field instead would take it out of those
+        // too, and out of every other doctype the workflow covers.
+        frm.set_df_property("workflow_state", "hidden", 1);
+
         let is_empty = !frm.doc.material_allocation || frm.doc.material_allocation.length === 0;
         if (
             (frm.is_new() || frm.doc.workflow_state === "Draft") &&
@@ -313,42 +325,66 @@ frappe.ui.form.on("Material Allocation", {
                                 return;
                             }
 
-                            let rows = items.map(d => {
-                                let row_style = "";
-                                if (d.qty_allocated > d.quantity_required) {
-                                    row_style = "background-color: #ffebee; color: #c62828;";
-                                }
+                            let esc = frappe.utils.escape_html;
+                            let num = function (v) {
+                                let n = parseFloat(v) || 0;
+                                return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+                            };
+
+                            let rows = items.map(function (d) {
                                 return `
-                                <tr style="${row_style}">
-                                    <td style="padding:8px 12px; font-weight:bold;">${d.item_code}</td>
-                                    <td style="padding:8px 12px;">${d.item_name}</td>
-                                    <td style="padding:8px 12px;">${d.uom}</td>
-                                    <td style="padding:8px 12px;">${d.quantity_required}</td>
-                                    <td style="padding:8px 12px; font-weight:bold;">${d.qty_allocated}</td>
-                                </tr>
-                                `;
+                                <tr>
+                                    <td>${esc(d.item_code)}</td>
+                                    <td>${esc(d.item_name || "")}</td>
+                                    <td>${esc(d.uom || "")}</td>
+                                    <td class="text-right">${num(d.quantity_required)}</td>
+                                    <td class="text-right">${num(d.qty_allocated)}</td>
+                                </tr>`;
                             }).join("");
 
+                            let over_count = items.filter(function (d) {
+                                return (parseFloat(d.qty_allocated) || 0) > (parseFloat(d.quantity_required) || 0);
+                            }).length;
+
                             let d_dialog = new frappe.ui.Dialog({
-                                title: "Allocated Items",
+                                title: __("Allocated Items"),
                                 size: "large",
                             });
+
+                            // Plain text and Frappe's own table classes, so the
+                            // dialog inherits the desk theme instead of carrying
+                            // its own. The only inline style is the horizontal
+                            // scroll wrapper, which is what keeps seven columns
+                            // usable on a narrow window - without it the table
+                            // widens the dialog and the page scrolls sideways.
                             d_dialog.body.innerHTML = `
-                                <p style="margin-bottom: 15px; font-size: 14px;">
-                                    <b>${ma_count} Material Allocation(s) have been done against this Batch Planning.</b>
+                                <p>
+                                    ${ma_count} Material Allocation(s) against
+                                    <b>${esc(frm.doc.batch_planning || "")}</b>, covering ${items.length} item(s).
                                 </p>
-                                <table class="table table-bordered" style="width:100%;font-size:13px;">
-                                    <thead style="background:#f1f5f9; color:#333;">
-                                        <tr>
-                                            <th style="padding:8px 12px;">Item Code</th>
-                                            <th style="padding:8px 12px;">Item Name</th>
-                                            <th style="padding:8px 12px;">UOM</th>
-                                            <th style="padding:8px 12px;">Qty Required</th>
-                                            <th style="padding:8px 12px;">Qty Allocated</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>${rows}</tbody>
-                                </table>
+                                <p class="text-muted small">
+                                    Approved allocations only. Excludes drafts, deallocated and cancelled.
+                                    Stock Entry Done is still an allocation.
+                                </p>
+                                <div style="overflow-x:auto;">
+                                    <table class="table table-bordered" style="min-width:460px;">
+                                        <thead>
+                                            <tr>
+                                                <th>Item Code</th>
+                                                <th>Item Name</th>
+                                                <th>UOM</th>
+                                                <th class="text-right">Qty Required</th>
+                                                <th class="text-right">Qty Allocated</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>${rows}</tbody>
+                                    </table>
+                                </div>
+                                ${over_count
+                                    ? `<p class="text-muted small">
+                                           ${over_count} item(s) allocated beyond the BOM requirement.
+                                       </p>`
+                                    : ""}
                             `;
                             d_dialog.show();
                         }
@@ -367,12 +403,17 @@ frappe.ui.form.on("Material Allocation", {
 
                 } else if (frm.doc.allocation_status === "Allocated") {
 
+                    // The Stock Entry is no longer raised from here - it is
+                    // made from the Material Request using ERPNext's own
+                    // Create > Stock Entry. So the live document to look for
+                    // is the request; the Stock Entry link is back-filled
+                    // server-side once that entry is submitted.
                     frappe.call({
                         method: "frappe.client.get_list",
                         args: {
-                            doctype: "Stock Entry",
+                            doctype: "Material Request",
                             filters: {
-                                name: frm.doc.stock_entry || "__none__",
+                                name: frm.doc.material_request || "__none__",
                                 docstatus: ["!=", 2],
                             },
                             fields: ["name", "docstatus"],
@@ -380,30 +421,79 @@ frappe.ui.form.on("Material Allocation", {
                         },
                         callback: function (r) {
                             if (r.message && r.message.length > 0) {
-                                let se = r.message[0];
+                                let mr = r.message[0];
                                 frm.add_custom_button(
-                                    __("📦 Open Stock Entry"),
+                                    __("📋 Open Material Request"),
                                     function () {
-                                        frappe.set_route("Form", "Stock Entry", se.name);
+                                        frappe.set_route("Form", "Material Request", mr.name);
                                     }
                                 ).addClass("btn-success");
 
-                                if (se.docstatus === 1) {
+                                if (frm.doc.stock_entry) {
+                                    frm.add_custom_button(
+                                        __("📦 Open Stock Entry"),
+                                        function () {
+                                            frappe.set_route("Form", "Stock Entry", frm.doc.stock_entry);
+                                        }
+                                    ).addClass("btn-success");
+                                }
+
+                                if (mr.docstatus === 1) {
                                     frm.dashboard.add_comment(
-                                        __("✅ Stock Entry <b>" + se.name + "</b> has been submitted. Deallocation is blocked."),
+                                        __("✅ Material Request <b>" + mr.name + "</b> is submitted. Deallocation is blocked. Use <b>Create &gt; Stock Entry</b> on the request to move the stock."),
                                         "green", true
                                     );
                                 } else {
                                     frm.dashboard.add_comment(
-                                        __("⚠️ Stock Entry <b>" + se.name + "</b> is in Draft. Submit it to complete the process."),
+                                        __("⚠️ Material Request <b>" + mr.name + "</b> is in Draft. Check its target warehouse and submit it."),
                                         "orange", true
                                     );
                                 }
                             } else {
-                                frm.add_custom_button(
-                                    __("📦 Create Stock Entry"),
-                                    function () { window.create_stock_entry(frm); }
-                                ).addClass("btn-primary");
+                                // COMPUTED FROM THE ROWS, not read from
+                                // requires_material_request, even though
+                                // set_pool_flags stamps exactly this figure.
+                                //
+                                // A stored flag is wrong here twice over. Before
+                                // its column is migrated the field is undefined,
+                                // which reads as falsy and hid the button on every
+                                // allocation - tagged ones included, which can
+                                // always be transferred. And after migrating,
+                                // allocations saved earlier carry the column
+                                // default of 0 until something re-saves them, so
+                                // they would stay broken with no visible cause.
+                                //
+                                // The child rows are always present and always
+                                // current, so deriving it here cannot go stale.
+                                // The stored flags remain for filtering and
+                                // reporting, which is what they are for.
+                                //
+                                // Same rule as set_pool_flags and
+                                // make_material_request: tagged rows transfer in
+                                // full, untagged rows only their main-sourced
+                                // share, because lab-sourced units are already
+                                // standing in the lab and never move.
+                                let transferable = (frm.doc.material_allocation || [])
+                                    .reduce(function (sum, row) {
+                                        let qty = parseFloat(row.allocate_qty) || 0;
+                                        if (qty <= 0) return sum;
+                                        if ((row.source_pool || "Tagged") === "Untagged") {
+                                            return sum + (parseFloat(row.main_allocated_qty) || 0);
+                                        }
+                                        return sum + qty;
+                                    }, 0);
+
+                                if (transferable > 0) {
+                                    frm.add_custom_button(
+                                        __("📋 Raise Material Request"),
+                                        function () { window.make_material_request(frm); }
+                                    ).addClass("btn-primary");
+                                } else {
+                                    frm.dashboard.add_comment(
+                                        __("No transfer needed — this allocation is covered entirely by stock already held in the lab. Material Request does not apply."),
+                                        "blue", true
+                                    );
+                                }
 
                                 frm.add_custom_button(
                                     __("Deallocate"),
@@ -471,10 +561,41 @@ window.apply_local_first_split = function (row) {
     row.global_allocated_qty = requested - row.local_allocated_qty;
 };
 
+// Untagged rows split LAB FIRST, into different fields, against a different
+// pool. Running the local-first splitter on one was actively wrong: local_free_qty
+// is 0 on an untagged row by construction, so the whole quantity landed in
+// global_allocated_qty - a TAGGED field - and the untagged split stayed empty.
+//
+// _lab_free / _main_free are stashed on the row by refresh_stock_available. They
+// are deliberately not fields: the server recomputes the split in
+// check_global_free_stock_limit on every save and discards whatever arrives, so
+// these exist only to keep the grid honest while the user is typing.
+window.apply_lab_first_split = function (row) {
+    let requested = Math.max(parseFloat(row.allocate_qty) || 0, 0);
+    let lab_free = Math.max(parseFloat(row._lab_free) || 0, 0);
+
+    row.lab_allocated_qty = Math.min(requested, lab_free);
+    row.main_allocated_qty = requested - row.lab_allocated_qty;
+    // An untagged row draws on neither tagged pool. Left non-zero, these would
+    // be read back as a tagged reservation.
+    row.local_free_qty = 0;
+    row.global_free_qty = 0;
+    row.local_allocated_qty = 0;
+    row.global_allocated_qty = 0;
+};
+
+window.apply_pool_split = function (row) {
+    if ((row.source_pool || "Tagged") === "Untagged") {
+        window.apply_lab_first_split(row);
+    } else {
+        window.apply_local_first_split(row);
+    }
+};
+
 frappe.ui.form.on("Material Allocation Item", {
     allocate_qty: function (frm, cdt, cdn) {
         let row = locals[cdt][cdn];
-        window.apply_local_first_split(row);
+        window.apply_pool_split(row);
         let grid = (frm.fields_dict["material_allocation"] || {}).grid;
         if (grid) grid.refresh_row(cdn);
         if (row.allocate_qty != row.quantity_required && !row.reason) {
@@ -561,6 +682,13 @@ window.refresh_stock_available = function (frm) {
         .then((data) => {
             let pr_po_map = data.message || {};
             items.forEach(function (row) {
+                // Untagged rows are measured against the untagged pile, never
+                // through free_stock_figures. Sending them down the tagged path
+                // is what replaced the builder's 51,300 with 9,850.
+                if ((row.source_pool || "Tagged") === "Untagged") {
+                    window.refresh_untagged_row(frm, row, pr_po_map[row.item_code] || {});
+                    return;
+                }
                 frappe.call({
                     method: "custom_batch_planning.custom_batch_planning.doctype.material_allocation.material_allocation.ma_get_allocated_qty",
                     args: {
@@ -605,6 +733,52 @@ window.refresh_stock_available = function (frm) {
                 });
             });
         });
+};
+
+// One untagged row refreshed against the untagged pool. Mirrors the tagged
+// branch of refresh_stock_available field for field, so the grid behaves the
+// same whichever pool a row came from.
+window.refresh_untagged_row = function (frm, row, pr_po) {
+    frappe.call({
+        method: "custom_batch_planning.custom_batch_planning.doctype.material_allocation.material_allocation.ma_get_untagged_free",
+        args: {
+            item_code: row.item_code,
+            employee_function: frm.doc.employee_function,
+            batch_planning: frm.doc.batch_planning,
+            exclude_parent: frm.doc.name,
+        },
+        callback: function (res) {
+            if (!res.message) return;
+            let grid_row =
+                frm.fields_dict["material_allocation"].grid.grid_rows_by_docname[row.name];
+            if (!grid_row) return;
+
+            let available = res.message.free_stock || 0;
+            let qty_req = grid_row.doc.quantity_required || 0;
+
+            // Not fields - see apply_lab_first_split.
+            grid_row.doc._lab_free = res.message.lab_free || 0;
+            grid_row.doc._main_free = res.message.main_free || 0;
+
+            grid_row.doc.stock_available = available;
+            grid_row.doc.shortage = Math.max(qty_req - available, 0);
+            grid_row.doc.open_pr = pr_po.open_pr || 0;
+            grid_row.doc.open_po = pr_po.open_po || 0;
+
+            window.apply_lab_first_split(grid_row.doc);
+
+            grid_row.refresh_field("local_free_qty");
+            grid_row.refresh_field("global_free_qty");
+            grid_row.refresh_field("local_allocated_qty");
+            grid_row.refresh_field("global_allocated_qty");
+            grid_row.refresh_field("lab_allocated_qty");
+            grid_row.refresh_field("main_allocated_qty");
+            grid_row.refresh_field("stock_available");
+            grid_row.refresh_field("shortage");
+            grid_row.refresh_field("open_pr");
+            grid_row.refresh_field("open_po");
+        },
+    });
 };
 
 window.auto_allocate_all = function (frm) {
@@ -722,39 +896,43 @@ window.deallocate_all = function (frm) {
     });
 };
 
-window.create_stock_entry = function (frm) {
+window.make_material_request = function (frm) {
     if (frm.is_dirty()) {
         frappe.msgprint(__("Save the document first."));
         return;
     }
 
-    if (frm.doc.stock_entry) {
+    if (frm.doc.material_request) {
         frappe.msgprint({
             title: __("Not Allowed"),
-            message: __("Stock Entry <b>" + frm.doc.stock_entry + "</b> already exists. Only one is allowed."),
+            message: __("Material Request <b>" + frm.doc.material_request + "</b> already exists. Only one is allowed."),
             indicator: "red"
         });
         return;
     }
 
-    frappe.confirm(
-        "Create a <b>Material Transfer</b> Stock Entry for all allocated items?",
-        function () {
-            frm.call({
-                doc: frm.doc,
-                method: "create_stock_entry",
-                freeze: true,
-                freeze_message: __("Creating Stock Entry..."),
-            }).then((r) => {
-                if (r.exc || !r.message) return;
-                frappe.show_alert({
-                    message: __("✅ " + r.message + " created — fill Cost Centre and Segment before submitting."),
-                    indicator: "green",
-                }, 7);
-                frappe.set_route("Form", "Stock Entry", r.message);
-            });
-        }
-    );
+    // Nothing is created here. The server returns an unsaved Material Request
+    // and this drops it into a new form, which is where Stage and Project
+    // Description get filled in - they are reqd on the doctype, so the form's
+    // own mandatory check collects them and Save is what turns it into a
+    // draft. Same shape as frappe.model.open_mapped_doc, called by hand
+    // because the source is a whitelisted doc method rather than a mapper.
+    frm.call({
+        doc: frm.doc,
+        method: "make_material_request",
+        freeze: true,
+        freeze_message: __("Preparing Material Request..."),
+    }).then((r) => {
+        if (r.exc || !r.message) return;
+        frappe.model.with_doctype("Material Request", function () {
+            let doc = frappe.model.sync(r.message)[0];
+            frappe.set_route("Form", doc.doctype, doc.name);
+            frappe.show_alert({
+                message: __("Fill in Stage and Project Description, then save."),
+                indicator: "blue",
+            }, 7);
+        });
+    });
 };
 
 window.load_expiry_status = function (frm) {
