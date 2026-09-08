@@ -51,7 +51,11 @@ class TestUntaggedPredicate(unittest.TestCase):
             sql = _bp_predicate(alias, "UNTAGGED", expr)
             self.assertIn(f"{alias}.batch_planning_id", sql)
             self.assertIn(f"{parent}.custom_batch_planning_no", sql)
-            self.assertIn(f"{parent}.custom_batch_planning,", sql)
+            # NOT the bare custom_batch_planning. It is defined on no doctype
+            # and exists only as an orphan column on databases old enough to
+            # predate its rename, so naming it made every untagged query a 1054
+            # everywhere else. This assertion used to require it.
+            self.assertNotIn(f"{parent}.custom_batch_planning,", sql)
             self.assertTrue(sql.endswith("IS NULL"), sql)
 
     def test_item_level_custom_field_is_covered_where_it_exists(self):

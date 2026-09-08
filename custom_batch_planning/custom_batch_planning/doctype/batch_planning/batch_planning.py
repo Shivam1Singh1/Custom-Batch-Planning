@@ -637,10 +637,15 @@ def create_bulk_material_allocations(batch_planning_name):
             })
 
         # quantity_required stays the GROSS BOM figure: it is what the batch
-        # consumes, and Material Allocation.validate uses it as the ceiling. But
-        # that same validate demands a Reason whenever allocate_qty differs from
-        # it, so a partially lab-covered row would block on a reason the system
-        # itself decided. Fill it in rather than making the user retype it.
+        # consumes, and Material Allocation.validate uses it as the ceiling.
+        #
+        # Reason is deliberately NOT filled in, even though that same validate
+        # demands one whenever allocate_qty differs from quantity_required, so a
+        # partially lab-covered row will not save until someone types it. It used
+        # to be written here from the lab-stock and already-allocated figures;
+        # the sentence was then the system's, not the user's, and the grid tint
+        # that marks an explained row lit up before anyone had explained
+        # anything. See apply_reason_highlight in material_allocation.js.
         row = {
             "doctype": "Material Allocation Item",
             "parenttype": "Material Allocation",
@@ -656,18 +661,6 @@ def create_bulk_material_allocations(batch_planning_name):
             "global_allocated_qty": round(from_shared, 2),
             "stock_available": round(cap, 2),
         }
-        held_notes = []
-        if lab_stock > 0:
-            held_notes.append(f"{round(lab_stock, 2)} {item['uom']} held in lab stock")
-        if allocated_already > 0:
-            held_notes.append(
-                f"{round(allocated_already, 2)} {item['uom']} already allocated on this plan"
-            )
-        if held_notes:
-            row["reason"] = (
-                "; ".join(held_notes)
-                + f"; allocating the {round(allocate_qty, 2)} shortfall only."
-            )
         ma_data["material_allocation"].append(row)
 
     if not ma_data["material_allocation"]:
@@ -1043,37 +1036,212 @@ def get_consolidated_bom_components(doc_name, scale="per_unit"):
     return sorted_components
 
 
-MR_APPROVED = "mr.docstatus = 1 AND mr.workflow_state LIKE 'Approve%%'"
-PO_APPROVED = "po.docstatus = 1 AND po.workflow_state LIKE 'Approve%%'"
-PR_APPROVED = "pr.docstatus = 1 AND pr.workflow_state LIKE 'Approve%%'"
+def _live_columns(doctype):
+    """Columns the running site ACTUALLY has for `doctype`.
+
+    Every expression below is assembled from this rather than from the schema
+    the author happened to be looking at, because those two are not the same
+    thing and the difference is not academic. mr.custom_batch_planning was named
+    here for months: it exists as an orphan column on databases old enough to
+    predate its rename to custom_batch_planning_no, and on every other site the
+    untagged queries died outright with "Unknown column" (1054) — a hard 500 on
+    a tab that had nothing to do with a field nobody had written to in a year.
+
+    A missing column is not an error here. It means the site cannot store that
+    particular flavour of tag / employee function / project, so no row can match
+    on it, so the term is dropped and the rest of the expression still answers.
+
+    Cached on frappe.local: one information_schema read per doctype per request,
+    and a bench migrate in another process cannot leave a stale answer behind
+    for longer than the request that started it.
+    """
+    cache = getattr(frappe.local, "_bp_live_columns", None)
+    if cache is None:
+        cache = {}
+        frappe.local._bp_live_columns = cache
+    if doctype not in cache:
+        try:
+            cache[doctype] = set(frappe.db.get_table_columns(doctype))
+        except Exception:
+            # An unknown or not-yet-created table answers "nothing exists",
+            # which drops every term rather than emitting SQL that cannot run.
+            cache[doctype] = set()
+    return cache[doctype]
+
+
+class _SchemaExpr:
+    """A SQL fragment built on first use, not at import.
+
+    These are consumed exclusively as f-string interpolations into
+    frappe.db.sql (`WHERE {MR_APPROVED}`), so __str__ and __format__ are the
+    whole interface — every existing call site keeps working untouched while the
+    fragment itself becomes a function of the live schema. It cannot be built at
+    import time: module import happens without a site bound, long before there
+    is a database to ask.
+    """
+
+    __slots__ = ("_build",)
+
+    def __init__(self, build):
+        self._build = build
+
+    def __str__(self):
+        return self._build()
+
+    def __format__(self, spec):
+        return format(str(self), spec)
+
+    def __contains__(self, needle):
+        return needle in str(self)
+
+    def __eq__(self, other):
+        return str(self) == other
+
+    def __hash__(self):
+        return hash(str(self))
+
+    def __getattr__(self, name):
+        # Anything else a caller does to a SQL fragment — .replace, .endswith,
+        # .strip — lands on the built string. These were plain str constants and
+        # the callers (tests included) still treat them as such; delegating is
+        # what keeps this a substitution rather than a migration.
+        return getattr(str(self), name)
+
+    def __repr__(self):
+        return "<%s %s>" % (type(self).__name__, self._build())
+
+
+def _coalesce_existing(*candidates):
+    """COALESCE over the candidate columns that exist here, in the order given.
+
+    candidates are (alias, doctype, fieldname) — the alias as it appears in the
+    query, the doctype whose table that alias stands for, and the field to read.
+
+    Yields the literal NULL when nothing survives. That is the honest answer,
+    and the callers already handle it: `<expr> = %(ef)s` matches no row (SQL
+    equality against NULL is never true), and _project_clause behaves the same.
+    _bp_predicate is the one place it flips the other way — `(NULL) IS NULL` is
+    TRUE, so a site with nowhere to store a batch tag would read every row as
+    untagged. That is the correct reading of such a site, and it cannot arise in
+    practice: batch_planning_id is recreated by the Batch Planning ID inventory
+    dimension on every migrate.
+    """
+
+    def build():
+        parts = [
+            "NULLIF(%s.%s,'')" % (alias, field)
+            for alias, doctype, field in candidates
+            if field in _live_columns(doctype)
+        ]
+        if not parts:
+            return "NULL"
+        if len(parts) == 1:
+            return parts[0]
+        return "COALESCE(" + ", ".join(parts) + ")"
+
+    return _SchemaExpr(build)
+
+
+def _approved(alias, doctype):
+    """Submitted AND workflow-approved, degrading to submitted where no workflow
+    exists.
+
+    workflow_state is not this app's field and is not shipped by it: Frappe
+    creates it as a Custom Field the moment a Workflow is defined for the
+    doctype, and a site with no such workflow has no such column. Naming it
+    unconditionally makes every open-pipeline query on that site a 1054.
+
+    Where the column is absent, docstatus = 1 IS the approval — there is no
+    other gate on that site for it to disagree with, so the figures stay
+    meaningful instead of the tab dying.
+    """
+
+    def build():
+        base = "%s.docstatus = 1" % alias
+        if "workflow_state" in _live_columns(doctype):
+            return base + " AND %s.workflow_state LIKE 'Approve%%%%'" % alias
+        return base
+
+    return _SchemaExpr(build)
+
+
+MR_APPROVED = _approved("mr", "Material Request")
+PO_APPROVED = _approved("po", "Purchase Order")
+PR_APPROVED = _approved("pr", "Purchase Receipt")
 
 MR_PURCHASE_ONLY = "mr.material_request_type = 'Purchase'"
 
-PR_UNAPPROVED = (
-    "pr.docstatus = 0 "
-    "AND (pr.workflow_state IS NULL OR ("
-    "pr.workflow_state NOT LIKE 'Approve%%' "
-    "AND pr.workflow_state NOT LIKE 'Reject%%' "
-    "AND pr.workflow_state NOT LIKE 'Cancel%%'))"
-)
 
-MR_EF = "COALESCE(NULLIF(mri.employee_function,''), NULLIF(mr.custom_employee_function,''))"
-MR_PROJECT = "COALESCE(NULLIF(mri.project,''), NULLIF(mr.project,''))"
-PO_EF = (
-    "COALESCE(NULLIF(poi.employee_function,''), NULLIF(poi.custom_employee_functions,''), "
-    "NULLIF(po.employee_function,''), NULLIF(po.custom_employee_functions,''))"
+def _pr_unapproved():
+    """Received but not yet approved by the Store Head.
+
+    Same workflow_state caveat as _approved, inverted: with no workflow column
+    there is no such thing as a receipt waiting for approval, so the predicate
+    becomes 1 = 0 rather than silently sweeping every draft receipt into the
+    Unapproved GRN column.
+    """
+
+    def build():
+        if "workflow_state" not in _live_columns("Purchase Receipt"):
+            return "pr.docstatus = 0 AND 1 = 0"
+        return (
+            "pr.docstatus = 0 "
+            "AND (pr.workflow_state IS NULL OR ("
+            "pr.workflow_state NOT LIKE 'Approve%%' "
+            "AND pr.workflow_state NOT LIKE 'Reject%%' "
+            "AND pr.workflow_state NOT LIKE 'Cancel%%'))"
+        )
+
+    return _SchemaExpr(build)
+
+
+PR_UNAPPROVED = _pr_unapproved()
+
+MR_EF = _coalesce_existing(
+    ("mri", "Material Request Item", "employee_function"),
+    ("mr", "Material Request", "custom_employee_function"),
 )
-PO_PROJECT = "COALESCE(NULLIF(poi.project,''), NULLIF(po.project,''))"
-PR_EF = "COALESCE(NULLIF(pri.employee_function,''), NULLIF(pr.employee_function,''))"
-PR_PROJECT = "COALESCE(NULLIF(pri.project,''), NULLIF(pr.project,''))"
+# mr.project is a Custom Field this app does not ship — neither in its fixtures
+# nor a stock ERPNext field, so it is present here and absent on any site that
+# never had that customisation. mri.project IS standard, which is why the item
+# level is read first and why dropping the parent term costs little.
+MR_PROJECT = _coalesce_existing(
+    ("mri", "Material Request Item", "project"),
+    ("mr", "Material Request", "project"),
+)
+PO_EF = _coalesce_existing(
+    ("poi", "Purchase Order Item", "employee_function"),
+    ("poi", "Purchase Order Item", "custom_employee_functions"),
+    ("po", "Purchase Order", "employee_function"),
+    ("po", "Purchase Order", "custom_employee_functions"),
+)
+PO_PROJECT = _coalesce_existing(
+    ("poi", "Purchase Order Item", "project"),
+    ("po", "Purchase Order", "project"),
+)
+PR_EF = _coalesce_existing(
+    ("pri", "Purchase Receipt Item", "employee_function"),
+    ("pr", "Purchase Receipt", "employee_function"),
+)
+PR_PROJECT = _coalesce_existing(
+    ("pri", "Purchase Receipt Item", "project"),
+    ("pr", "Purchase Receipt", "project"),
+)
 
 # Every place a batch tag can live on a pipeline row, coalesced the same way
 # EF and Project already are above.
 #
 # It is not one field. A document can carry the tag on the ITEM
 # (batch_planning_id, or the older custom_batch_planning_no) or on the PARENT
-# (custom_batch_planning_no, or custom_batch_planning) — four fields for MR and
-# PO, three for PR, which has no item-level custom field.
+# (custom_batch_planning_no) — three fields for MR and PO, two for PR, which has
+# no item-level custom field.
+#
+# A fourth parent field, custom_batch_planning, used to be read here and was
+# removed: it is not a Custom Field on any of the three doctypes and survives
+# only as an orphan column on databases old enough to predate its rename to
+# custom_batch_planning_no. It can hold no data on a site that lacks the
+# leftover, and naming it there was a hard 1054. Old client code such as
+# gate_pass_control's banana.js still assigns it; that write goes nowhere.
 #
 # Checking only the item's batch_planning_id, as the untagged columns first did,
 # calls a document untagged when its parent plainly names a Batch Planning. On
@@ -1081,17 +1249,19 @@ PR_PROJECT = "COALESCE(NULLIF(pri.project,''), NULLIF(pr.project,''))"
 # more carrying only the item-level custom field, and one row each on PO and PR
 # — PR-2026-2027-00002 among them, whose header reads BP-26-11-001 while its
 # single item row has no batch_planning_id at all.
-MR_BP = (
-    "COALESCE(NULLIF(mri.batch_planning_id,''), NULLIF(mri.custom_batch_planning_no,''), "
-    "NULLIF(mr.custom_batch_planning_no,''), NULLIF(mr.custom_batch_planning,''))"
+MR_BP = _coalesce_existing(
+    ("mri", "Material Request Item", "batch_planning_id"),
+    ("mri", "Material Request Item", "custom_batch_planning_no"),
+    ("mr", "Material Request", "custom_batch_planning_no"),
 )
-PO_BP = (
-    "COALESCE(NULLIF(poi.batch_planning_id,''), NULLIF(poi.custom_batch_planning_no,''), "
-    "NULLIF(po.custom_batch_planning_no,''), NULLIF(po.custom_batch_planning,''))"
+PO_BP = _coalesce_existing(
+    ("poi", "Purchase Order Item", "batch_planning_id"),
+    ("poi", "Purchase Order Item", "custom_batch_planning_no"),
+    ("po", "Purchase Order", "custom_batch_planning_no"),
 )
-PR_BP = (
-    "COALESCE(NULLIF(pri.batch_planning_id,''), "
-    "NULLIF(pr.custom_batch_planning_no,''), NULLIF(pr.custom_batch_planning,''))"
+PR_BP = _coalesce_existing(
+    ("pri", "Purchase Receipt Item", "batch_planning_id"),
+    ("pr", "Purchase Receipt", "custom_batch_planning_no"),
 )
 
 
@@ -2863,23 +3033,15 @@ def create_untagged_material_allocation(batch_planning_name):
             "main_allocated_qty": round(from_main, 2),
         }
 
-        # validate demands a Reason whenever Qty Requested differs from BOM Qty,
-        # and partial coverage is the normal case here — the untagged pile is
-        # whatever happened to be bought without a batch tag, not a pile sized to
-        # this plan. Filling it in beats making the user retype the same sentence
-        # on most of fifty rows. Same reasoning as create_bulk_material_allocations.
-        if round(allocate_qty, 2) != round(qty_required, 2):
-            reason = (
-                f"Untagged pool covers {round(allocate_qty, 2)} of "
-                f"{round(qty_required, 2)} {item.get('uom') or ''}".strip()
-                + f" (lab {round(lab_free, 2)} + main store {round(main_free, 2)})"
-            )
-            if bp_lab_stock > 0:
-                reason += f"; {round(bp_lab_stock, 2)} already held in this batch's lab"
-            if reserved > 0:
-                reason += f"; {round(reserved, 2)} already reserved on this plan"
-            row["reason"] = reason + "."
-
+        # Reason is left EMPTY, and that is a deliberate cost. validate demands
+        # one whenever Qty Requested differs from BOM Qty, and partial coverage
+        # is the normal case here — the untagged pile is whatever happened to be
+        # bought without a batch tag, not a pile sized to this plan — so most
+        # rows now need a reason typed before the allocation will save. The
+        # sentence this used to generate from the pool figures explained the
+        # arithmetic, not the decision, and it tinted every such row on arrival
+        # as though a person had already justified it. Same reasoning as
+        # create_bulk_material_allocations.
         rows.append(row)
 
     if not rows:

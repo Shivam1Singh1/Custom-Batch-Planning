@@ -523,13 +523,7 @@ frappe.ui.form.on("Material Allocation", {
 
         setTimeout(function () {
             (frm.doc.material_allocation || []).forEach(function (row) {
-                if (row.reason && row.allocate_qty != row.quantity_required) {
-                    let grid_row =
-                        frm.fields_dict["material_allocation"].grid.grid_rows_by_docname[row.name];
-                    if (grid_row && grid_row.row) {
-                        grid_row.row.css("background-color", "#f3e5f5");
-                    }
-                }
+                window.apply_reason_highlight(frm, row);
             });
         }, 1000);
     },
@@ -560,6 +554,24 @@ frappe.ui.form.on("Material Allocation", {
     },
 
 });
+
+// The tint marks a row somebody has EXPLAINED, and nothing else.
+//
+// It used to mean "partially covered and carrying a reason", which tinted
+// practically every row the moment the grid loaded: the two bulk creators in
+// batch_planning.py wrote the reason themselves, so the colour was reporting
+// the system's own sentence back to the user. Both auto-fills are gone, so a
+// reason can now only have been typed by a person, and the row lights up when
+// they type it rather than before they arrive.
+//
+// Called on refresh for saved rows and from the reason handler while editing;
+// it clears the tint as well as sets it, so emptying the field undoes it.
+window.apply_reason_highlight = function (frm, row) {
+    let grid = (frm.fields_dict["material_allocation"] || {}).grid;
+    let grid_row = grid && grid.grid_rows_by_docname[row.name];
+    if (!grid_row || !grid_row.row) return;
+    grid_row.row.css("background-color", (row.reason || "").trim() ? "#f3e5f5" : "");
+};
 
 window.apply_local_first_split = function (row) {
     let requested = Math.max(parseFloat(row.allocate_qty) || 0, 0);
@@ -612,6 +624,10 @@ frappe.ui.form.on("Material Allocation Item", {
                 indicator: "orange",
             });
         }
+    },
+
+    reason: function (frm, cdt, cdn) {
+        window.apply_reason_highlight(frm, locals[cdt][cdn]);
     },
 
     before_material_allocation_remove: function (frm, cdt, cdn) {
