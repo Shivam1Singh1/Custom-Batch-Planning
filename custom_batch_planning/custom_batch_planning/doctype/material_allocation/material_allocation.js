@@ -491,6 +491,26 @@ frappe.ui.form.on("Material Allocation", {
                                         return sum + qty;
                                     }, 0);
 
+                                // Whether any part of this allocation drew on
+                                // the untagged pile. Derived from the rows for
+                                // the same reason transferable is: the stored
+                                // has_untagged_items flag is unreliable on
+                                // documents saved before it was populated —
+                                // MA-BP-26-10-001-03 and -04 both carry 0 while
+                                // holding an untagged row — so reading it would
+                                // leave Deallocate showing on exactly the older
+                                // allocations this is meant to protect.
+                                //
+                                // .some, not "every row is untagged": a mixed
+                                // document holds an untagged claim too, and the
+                                // release path below has to cover it. None exist
+                                // today, but source_pool is per row, so one can.
+                                let has_untagged = (frm.doc.material_allocation || [])
+                                    .some(function (row) {
+                                        return (row.source_pool || "Tagged") === "Untagged"
+                                            && (parseFloat(row.allocate_qty) || 0) > 0;
+                                    });
+
                                 if (transferable > 0) {
                                     frm.add_custom_button(
                                         __("📋 Raise Material Request"),
@@ -503,10 +523,31 @@ frappe.ui.form.on("Material Allocation", {
                                     );
                                 }
 
-                                frm.add_custom_button(
-                                    __("Deallocate"),
-                                    function () { window.deallocate_all(frm); }
-                                ).addClass("btn-danger");
+                                // Deallocate is withheld once an untagged
+                                // allocation is live. The claim is the only
+                                // record that those lab units are spoken for —
+                                // allocating untagged lab stock posts no ledger
+                                // row (see MaterialAllocation.deallocate), so
+                                // releasing it silently returns the units to the
+                                // pool with nothing anywhere to show it happened.
+                                //
+                                // NOT a dead end: cancelling the document
+                                // releases the claim just as well, because
+                                // _untagged_allocated_qty filters on
+                                // `ma.docstatus != 2`. Cancel leaves an audit
+                                // trail where Deallocate leaves only a status
+                                // flip, which is the point of routing through it.
+                                if (has_untagged) {
+                                    frm.dashboard.add_comment(
+                                        __("🔒 This allocation draws on the untagged pool and cannot be deallocated. To release the claim, cancel this document."),
+                                        "blue", true
+                                    );
+                                } else {
+                                    frm.add_custom_button(
+                                        __("Deallocate"),
+                                        function () { window.deallocate_all(frm); }
+                                    ).addClass("btn-danger");
+                                }
                             }
                         },
                     });

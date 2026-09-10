@@ -2258,7 +2258,12 @@ window.cbp_show_lab_breakdown = function (doc_name, item_code) {
                         totals: (parseFloat(d.allocated) || 0) > 0
                             ? [
                                 { label: "Gross untagged lab stock", qty: d.total },
-                                { label: "Less allocated — shown as Labware", qty: d.allocated },
+                                // Pool-wide, NOT this batch's Labware figure.
+                                // Lab Item is net of every batch's untagged
+                                // claim, so naming Labware here pointed at a
+                                // column that reads 0 whenever the claim
+                                // belongs to a different Batch Planning.
+                                { label: "Less allocated to this function's batches", qty: d.allocated },
                                 { label: "Available — matches Lab Item on the row", qty: d.available },
                               ]
                             : [{ label: "Total — matches Lab Item on the row", qty: d.total }],

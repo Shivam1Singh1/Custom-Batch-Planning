@@ -160,6 +160,7 @@ class TestUntaggedMaterialDataLive(unittest.TestCase):
                 "qty_required", "total_stock", "main_stock", "global_allocated",
                 "current_allocated", "current_main_allocated",
                 "free_qty", "lab_stock", "lab_available", "labware_qty",
+                "lab_allocated_global",
                 "global_main_allocated", "lab_after_alloc",
                 "mr_qty", "po_qty", "pr_qty", "net_requirement",
             ):
@@ -201,19 +202,37 @@ class TestUntaggedMaterialDataLive(unittest.TestCase):
                 r["current_main_allocated"], r["current_allocated"] + 1e-6,
                 msg=f"Main-sourced share exceeds the whole draw on {r['item_code']}",
             )
-            # The symbolic lab_item -> Labware move: what Lab Item gives up,
-            # Labware takes, and the gross figure Total Stock reconciles
-            # against is untouched by it.
+            # The symbolic lab_item -> Labware move: what Lab Item gives up, the
+            # pool takes, and the gross figure Total Stock reconciles against is
+            # untouched by it.
+            #
+            # Against lab_allocated_global, NOT labware_qty. Lab Item is net of
+            # every batch's untagged claim on this pool, while Labware reports
+            # only the claim THIS batch made — so the two balance solely on the
+            # plan that made the allocation. Asserting on labware_qty here would
+            # demand that no other batch ever holds a claim, which failed the
+            # moment one 2-unit draw on BP-26-10-001 left the other thirteen
+            # plans under VP-LTP-MFG-001 with Lab Item 19 against gross 21.
             self.assertAlmostEqual(
-                r["lab_available"] + r["labware_qty"], r["lab_stock"], places=1,
-                msg=f"Lab Item + Labware != gross lab stock on {r['item_code']}",
+                r["lab_available"] + r["lab_allocated_global"], r["lab_stock"],
+                places=1,
+                msg=f"Lab Item + pool lab claim != gross lab stock on {r['item_code']}",
             )
-            # The Allocated column dropped its lab half to Labware. Nothing was
-            # lost in the move: the two still account for the whole reservation.
+            # The Allocated column dropped its lab half. Nothing was lost in the
+            # move: the two still account for the whole reservation — at pool
+            # scope, which is what global_main_allocated was derived from.
             self.assertAlmostEqual(
-                r["global_main_allocated"] + r["labware_qty"],
+                r["global_main_allocated"] + r["lab_allocated_global"],
                 r["global_allocated"], places=1,
-                msg=f"Allocated + Labware != total reservation on {r['item_code']}",
+                msg=f"Allocated + pool lab claim != total reservation on {r['item_code']}",
+            )
+            # Labware is this batch's own draw, so it can never exceed the
+            # pool-wide claim it is a share of. This is the assertion that would
+            # have caught the leak: under the old global figure the two were
+            # equal by construction and nothing could ever fail.
+            self.assertLessEqual(
+                r["labware_qty"], r["lab_allocated_global"] + 1e-6,
+                msg=f"Labware exceeds the pool-wide lab claim on {r['item_code']}",
             )
             # And the row still reads straight across.
             self.assertAlmostEqual(

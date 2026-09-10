@@ -2685,8 +2685,35 @@ def get_untagged_material_data(doc_name):
         # warehouses; allocation only records who they belong to. Labware is the
         # readout of that claim, not a warehouse. See the lock recorded on
         # MaterialAllocation.deallocate.
+        #
+        # GLOBAL, and it must stay global: it feeds lab_available and
+        # global_main_allocated, both of which are pool arithmetic. Every batch
+        # drawing on this pool has to see the whole claim or two of them would
+        # reserve the same units. It is NOT what the Labware column shows —
+        # see current_lab_allocated below.
         lab_allocated = _untagged_allocated_qty(
             item_code, employee_function, doc.name, "global", component="lab"
+        )
+
+        # What the LABWARE column shows: THIS batch's own lab-sourced draw.
+        #
+        # Scoped to doc.name because the claim carries a batch tag even though
+        # the stock does not. Allocating from the untagged pool writes no ledger
+        # row — the units stay untagged in Stock Ledger Entry — but the Material
+        # Allocation that records the claim names its Batch Planning, and that
+        # is the tag Labware reports.
+        #
+        # It read the global figure until this was split, which put another
+        # batch's claim on every row: one 2-unit untagged allocation on
+        # BP-26-10-001 showed as Labware 2 on all fourteen approved plans under
+        # VP-LTP-MFG-001, including plans whose own untagged draw was zero.
+        # Labware sits on a per-batch row beside per-batch figures, so it is
+        # read as per-batch whatever the tooltip says.
+        #
+        # Other batches' claims are still visible — in Lab Item, which is net of
+        # the global figure. They are simply no longer attributed to this batch.
+        current_lab_allocated = _untagged_allocated_qty(
+            item_code, employee_function, doc.name, "current", component="lab"
         )
 
         # What the ALLOCATED column shows: the MAIN-sourced share only.
@@ -2775,7 +2802,11 @@ def get_untagged_material_data(doc_name):
                 "free_qty": round(free_qty, 2),
                 "lab_stock": round(lab_stock, 2),
                 "lab_available": round(lab_available, 2),
-                "labware_qty": round(lab_allocated, 2),
+                "labware_qty": round(current_lab_allocated, 2),
+                # The pool-wide lab claim, kept for the drill-down: Lab Item is
+                # net of THIS, not of labware_qty, so the dialog needs it to
+                # reconcile the subtraction it shows.
+                "lab_allocated_global": round(lab_allocated, 2),
                 "lab_after_alloc": round(lab_after_alloc, 2),
                 "mr_qty": mr_qty,
                 "mr_count": mr_count,
