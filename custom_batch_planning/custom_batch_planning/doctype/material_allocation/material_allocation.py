@@ -205,9 +205,6 @@ class MaterialAllocation(Document):
                 row.local_allocated_qty = row_split["from_local"]
                 row.global_allocated_qty = row_split["from_global"]
                 row.stock_available = split["capacity"]
-                # A tagged row draws on neither untagged half. Blanked rather
-                # than left alone so a row switched between pools cannot carry a
-                # stale breakdown that _untagged_allocated_qty would then count.
                 row.lab_allocated_qty = 0
                 row.main_allocated_qty = 0
 
@@ -247,14 +244,7 @@ class MaterialAllocation(Document):
             for row, row_split in zip(rows, split["rows"]):
                 row.lab_allocated_qty = row_split["from_lab"]
                 row.main_allocated_qty = row_split["from_main"]
-                # stock_available is what validate() checks Qty Requested
-                # against, and validate() runs this method first precisely so the
-                # ceiling it enforces is the server's, not the client's.
                 row.stock_available = split["capacity"]
-                # The tagged breakdown is meaningless on an untagged row, and
-                # leaving whatever the client sent would let _allocated_qty
-                # attribute untagged units to a tagged pool if source_pool were
-                # ever cleared.
                 row.local_free_qty = 0
                 row.global_free_qty = 0
                 row.local_allocated_qty = 0
@@ -349,8 +339,6 @@ class MaterialAllocation(Document):
         if not warehouse:
             frappe.throw(f"No store warehouse found for Employee Function: {self.employee_function}")
 
-        # Resolved on first use only. Most allocations are tagged and never need
-        # it, and this runs on a document the user has already waited on.
         lab_warehouses = None
 
         for item in self.material_allocation:
@@ -370,33 +358,10 @@ class MaterialAllocation(Document):
                         frappe.get_doc("Employee Function", self.employee_function)
                     )
 
-                # Both halves of the pool this row drew on. The store Bin alone
-                # would understate what is available to an untagged row and send
-                # the non-batch fallback below to the wrong answer.
                 item.stock_available = self._bin_qty(
                     item.item_code, [warehouse] + lab_warehouses
                 )
 
-                # THE SPLIT IS RECOMPUTED HERE, not read off the row, and that
-                # is the difference between this working and quietly doing
-                # nothing.
-                #
-                # Reading the stored fields broke re-allocation. deallocate()
-                # zeroes lab_allocated_qty and main_allocated_qty, so on
-                # deallocate -> Allocate again both halves arrived as 0, both
-                # _fill_from_batches calls were handed qty_needed = 0 and wrote
-                # no batch rows, and the non-batch fallback below then set
-                # qty_allocated with an EMPTY batch_details. The split was
-                # restored moments later by check_global_free_stock_limit on
-                # save — long after the FEFO pass that needed it.
-                #
-                # Recomputing also keeps this honest when the draft is old: the
-                # pool may have moved since the builder sized the row, and the
-                # batches named here should reflect what is free now.
-                #
-                # check_global_free_stock_limit runs the same two functions with
-                # the same arguments on the save below, so it lands on the same
-                # numbers rather than overwriting these with different ones.
                 figures = untagged_free_figures(
                     item.item_code,
                     warehouse,
@@ -413,9 +378,6 @@ class MaterialAllocation(Document):
                 item.lab_allocated_qty = split["rows"][0]["from_lab"]
                 item.main_allocated_qty = split["rows"][0]["from_main"]
 
-                # Each portion filled from where it was actually reserved, and
-                # lab first — matching split_lab_first, so the batches named here
-                # are the ones the allocation is accounted against.
                 total_allocated = self._fill_from_batches(
                     item, lab_warehouses, item.lab_allocated_qty
                 )
@@ -428,8 +390,6 @@ class MaterialAllocation(Document):
                     item, [warehouse], qty_needed
                 )
 
-            # Non-batch items have no batch rows to find, so a zero fill against
-            # sufficient stock means "not batch-tracked", not "nothing there".
             if total_allocated == 0 and flt(item.stock_available) >= qty_needed:
                 total_allocated = qty_needed
 
@@ -587,19 +547,6 @@ class MaterialAllocation(Document):
                     f"Draft Stock Entry <b>{existing_se.name}</b> exists. Delete or submit it first."
                 )
 
-        # A Material Request now sits between the allocation and the Stock
-        # Entry, which opens a window the Stock Entry check alone cannot see:
-        # the request is raised and approved, but nobody has pressed Create >
-        # Stock Entry yet. The stock is committed at that point even though no
-        # Stock Entry exists, so deallocating would release quantities an
-        # approved request is already counting on.
-        #
-        # docstatus is the gate rather than workflow_state. Where a Material
-        # Request workflow is installed it only reaches docstatus 1 on its
-        # approve transition (the pattern Slot Opening uses), so submitted and
-        # approved coincide; where none is installed, docstatus 1 is the only
-        # signal there is. Reading workflow_state instead would silently pass
-        # everything on a site with no workflow.
         existing_mr = self.get_linked_material_request()
         if existing_mr:
             if existing_mr.docstatus == 1:
@@ -616,20 +563,6 @@ class MaterialAllocation(Document):
             item.shortage = flt(item.quantity_required)
             item.set("batch_details", [])
 
-            # Clear the untagged breakdown, but NOT the tagged one, and the
-            # asymmetry is deliberate.
-            #
-            # _UNTAGGED_COLUMN sums lab_allocated_qty and main_allocated_qty
-            # straight, so zeroing them is belt-and-braces: a future query that
-            # forgets the status filter still cannot resurrect a released claim.
-            #
-            # Doing the same to local_allocated_qty / global_allocated_qty would
-            # be a bug. _SOURCE_COLUMN reads a zero pair as "no breakdown
-            # recorded" and falls back to charging the WHOLE reservation to the
-            # batch's own stock — the exact legacy-row trap
-            # patches/backfill_allocation_source_split.py exists to repair. The
-            # tagged split is audit evidence of where the units came from and
-            # must survive deallocation.
             if (item.source_pool or "Tagged") == "Untagged":
                 item.lab_allocated_qty = 0
                 item.main_allocated_qty = 0
@@ -730,46 +663,22 @@ class MaterialAllocation(Document):
         mr.material_request_type = "Material Transfer"
         mr.transaction_date = today()
         mr.schedule_date = schedule_date
-        # Material Allocation carries no company of its own, so this falls back
-        # to the session default and, failing that, to whatever default the
-        # Material Request field itself declares.
         company = frappe.defaults.get_user_default("Company")
         if company:
             mr.company = company
         mr.set_from_warehouse = ef.from_warehouse
         mr.set_warehouse = ef.to_warehouse
         mr.custom_batch_planning_no = self.batch_planning
-        # What stamp_material_allocation reads once the user saves. Left off
-        # the item rows on purpose - the allocation is a property of the whole
-        # request, and batch_planning_id already carries the per-row tagging.
         mr.custom_material_allocation = self.name
 
-        # employee_function and project are not decoration. validate_tagging in
-        # api/tagging_enforcement.py fires on Material Request validate, and
-        # is_exempt() only ever exempts Stock Entry - a Material Request dated
-        # after the stock cutover is rejected outright unless both are present
-        # on the parent AND on every item row. Dropping either side in a later
-        # refactor breaks saving, not just reporting.
         mr.custom_employee_function = self.employee_function
         mr.project = self.project_id
 
-        # Field is custom_function_head_name on Material Request but plain
-        # function_head_name on this doctype and on Employee Function - the
-        # custom-field prefix applies only where the field was bolted onto a
-        # standard ERPNext doctype.
-        #
-        # This document's own copy wins, so a request reflects the head recorded
-        # when the allocation was made rather than whoever holds the post today.
-        # The Employee Function is the fallback for allocations created before
-        # the value was captured, which would otherwise leave the request blank
-        # with no way for the user to know where it should have come from.
         mr.custom_function_head_name = (
             self.function_head_name or ef.function_head_name
         )
 
         for row in self.material_allocation:
-            # See the note above: the lab-sourced half of an untagged row never
-            # moves, so it must never reach a Material Request.
             if (row.source_pool or "Tagged") == "Untagged":
                 qty = flt(row.main_allocated_qty)
             else:
@@ -784,13 +693,9 @@ class MaterialAllocation(Document):
                 "schedule_date": schedule_date,
                 "from_warehouse": ef.from_warehouse,
                 "warehouse": ef.to_warehouse,
-                # segment and cost_center are reqd on Material Request Item, so
-                # a row without them fails the insert on mandatory, not on
-                # tagging.
                 "segment": ef.segment,
                 "cost_center": ef.cost_center,
                 "batch_planning_id": self.batch_planning,
-                # Required by validate_tagging - see the note above.
                 "employee_function": self.employee_function,
                 "project": self.project_id,
             })
@@ -802,9 +707,6 @@ class MaterialAllocation(Document):
                 "units are already standing in the lab."
             )
 
-        # Returned, not inserted. json_handler serialises this through
-        # as_dict(), which keeps the __islocal flag frappe.model.sync needs to
-        # treat it as a new form rather than an existing record.
         return mr
 
     def save_allocation_log(self, status):
@@ -915,10 +817,6 @@ class MaterialAllocation(Document):
             "to_warehouse": pick("table_szrn", "lab_warehouse"),
             "segment": pick("table_xlgh", "segment"),
             "cost_center": pick("cost_center", "cost_center"),
-            # A plain field on the Employee Function, not a child table, so it
-            # needs no pick(). Included here rather than read separately in
-            # make_material_request so every value the request takes from the
-            # function comes from one read of one document.
             "function_head_name": ef_doc.get("function_head_name"),
         })
 
@@ -1198,16 +1096,9 @@ def on_stock_entry_submit(stock_entry_name):
 
     ma_doc = frappe.get_doc("Material Allocation", ma_name)
 
-    # Both pre-transfer statuses are valid starting points. An allocation whose
-    # request has been raised sits at "Material Request Done", and that is the
-    # normal path into a Stock Entry — refusing it here would leave the
-    # allocation stuck holding stock forever after the transfer had happened.
     if ma_doc.allocation_status not in ("Allocated", "Material Request Done"):
         return
 
-    # Resolved through the Material Request on a first transfer, so record the
-    # Stock Entry here. That is what lets the allocation link straight to it
-    # instead of routing every visit back through the request.
     if not ma_doc.stock_entry:
         ma_doc.db_set("stock_entry", stock_entry_name, update_modified=False)
 
@@ -1281,9 +1172,6 @@ def get_allocated_items(batch_planning, employee_function):
         ORDER BY mai.item_code
     """, {"bp": batch_planning, "ef": employee_function}, as_dict=True)
 
-    # The same set the rows came from, so the headline count and the table can
-    # never disagree. Counting Material Allocation separately is what let the
-    # dialog claim four allocations while showing one item.
     ma_count = flt(frappe.db.sql(f"""
         SELECT COUNT(DISTINCT ma.name)
         FROM `tabMaterial Allocation Item` mai

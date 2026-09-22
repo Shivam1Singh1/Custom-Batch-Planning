@@ -1,9 +1,3 @@
-// Body markup for the "⚠️ Shared Free Stock" confirmation, rendered into the
-// dialog's HTML field. An identical copy lives in batch_planning.js — keep the
-// two in step; each form only loads its own doctype's script, so neither can
-// borrow the other's definition. Fixed column widths stop a long item code from
-// squeezing the four numeric columns into each other, and the header and total
-// rows stay pinned while the item list scrolls.
 window.render_shared_stock_table = function (opts) {
     let esc = function (v) {
         return frappe.utils.escape_html(v === null || v === undefined ? "" : String(v));
@@ -218,16 +212,6 @@ frappe.ui.form.on("Material Allocation", {
 
         frm.clear_custom_buttons();
 
-        // The field is redundant on the form: Frappe already prints the same
-        // value as the status badge beside the title, and the workflow's own
-        // action buttons are what change it. Two copies of one value invited
-        // the reading that the field could be edited.
-        //
-        // Hidden on the FORM only, deliberately. The value still drives the
-        // Allocate and Material Request gating below, still filters the
-        // batch_planning query, and is untouched in the list view and reports.
-        // Setting hidden on the Custom Field instead would take it out of those
-        // too, and out of every other doctype the workflow covers.
         frm.set_df_property("workflow_state", "hidden", 1);
 
         let is_empty = !frm.doc.material_allocation || frm.doc.material_allocation.length === 0;
@@ -351,12 +335,6 @@ frappe.ui.form.on("Material Allocation", {
                                 size: "large",
                             });
 
-                            // Plain text and Frappe's own table classes, so the
-                            // dialog inherits the desk theme instead of carrying
-                            // its own. The only inline style is the horizontal
-                            // scroll wrapper, which is what keeps seven columns
-                            // usable on a narrow window - without it the table
-                            // widens the dialog and the page scrolls sideways.
                             d_dialog.body.innerHTML = `
                                 <p>
                                     ${ma_count} Material Allocation(s) against
@@ -403,19 +381,7 @@ frappe.ui.form.on("Material Allocation", {
 
                 } else if (["Allocated", "Material Request Done"]
                                .indexOf(frm.doc.allocation_status) > -1) {
-                    // Both pre-transfer states land here. The branch already
-                    // decides what to show by looking up the live Material
-                    // Request, so it handles either state without further
-                    // splitting: with a request it offers Open Material Request,
-                    // without one it offers Raise Material Request and
-                    // Deallocate. Keying on "Allocated" alone left the toolbar
-                    // empty the moment a request was saved.
 
-                    // The Stock Entry is no longer raised from here - it is
-                    // made from the Material Request using ERPNext's own
-                    // Create > Stock Entry. So the live document to look for
-                    // is the request; the Stock Entry link is back-filled
-                    // server-side once that entry is submitted.
                     frappe.call({
                         method: "frappe.client.get_list",
                         args: {
@@ -458,29 +424,6 @@ frappe.ui.form.on("Material Allocation", {
                                     );
                                 }
                             } else {
-                                // COMPUTED FROM THE ROWS, not read from
-                                // requires_material_request, even though
-                                // set_pool_flags stamps exactly this figure.
-                                //
-                                // A stored flag is wrong here twice over. Before
-                                // its column is migrated the field is undefined,
-                                // which reads as falsy and hid the button on every
-                                // allocation - tagged ones included, which can
-                                // always be transferred. And after migrating,
-                                // allocations saved earlier carry the column
-                                // default of 0 until something re-saves them, so
-                                // they would stay broken with no visible cause.
-                                //
-                                // The child rows are always present and always
-                                // current, so deriving it here cannot go stale.
-                                // The stored flags remain for filtering and
-                                // reporting, which is what they are for.
-                                //
-                                // Same rule as set_pool_flags and
-                                // make_material_request: tagged rows transfer in
-                                // full, untagged rows only their main-sourced
-                                // share, because lab-sourced units are already
-                                // standing in the lab and never move.
                                 let transferable = (frm.doc.material_allocation || [])
                                     .reduce(function (sum, row) {
                                         let qty = parseFloat(row.allocate_qty) || 0;
@@ -491,20 +434,6 @@ frappe.ui.form.on("Material Allocation", {
                                         return sum + qty;
                                     }, 0);
 
-                                // Whether any part of this allocation drew on
-                                // the untagged pile. Derived from the rows for
-                                // the same reason transferable is: the stored
-                                // has_untagged_items flag is unreliable on
-                                // documents saved before it was populated —
-                                // MA-BP-26-10-001-03 and -04 both carry 0 while
-                                // holding an untagged row — so reading it would
-                                // leave Deallocate showing on exactly the older
-                                // allocations this is meant to protect.
-                                //
-                                // .some, not "every row is untagged": a mixed
-                                // document holds an untagged claim too, and the
-                                // release path below has to cover it. None exist
-                                // today, but source_pool is per row, so one can.
                                 let has_untagged = (frm.doc.material_allocation || [])
                                     .some(function (row) {
                                         return (row.source_pool || "Tagged") === "Untagged"
@@ -523,20 +452,6 @@ frappe.ui.form.on("Material Allocation", {
                                     );
                                 }
 
-                                // Deallocate is withheld once an untagged
-                                // allocation is live. The claim is the only
-                                // record that those lab units are spoken for —
-                                // allocating untagged lab stock posts no ledger
-                                // row (see MaterialAllocation.deallocate), so
-                                // releasing it silently returns the units to the
-                                // pool with nothing anywhere to show it happened.
-                                //
-                                // NOT a dead end: cancelling the document
-                                // releases the claim just as well, because
-                                // _untagged_allocated_qty filters on
-                                // `ma.docstatus != 2`. Cancel leaves an audit
-                                // trail where Deallocate leaves only a status
-                                // flip, which is the point of routing through it.
                                 if (has_untagged) {
                                     frm.dashboard.add_comment(
                                         __("🔒 This allocation draws on the untagged pool and cannot be deallocated. To release the claim, cancel this document."),
@@ -596,17 +511,6 @@ frappe.ui.form.on("Material Allocation", {
 
 });
 
-// The tint marks a row somebody has EXPLAINED, and nothing else.
-//
-// It used to mean "partially covered and carrying a reason", which tinted
-// practically every row the moment the grid loaded: the two bulk creators in
-// batch_planning.py wrote the reason themselves, so the colour was reporting
-// the system's own sentence back to the user. Both auto-fills are gone, so a
-// reason can now only have been typed by a person, and the row lights up when
-// they type it rather than before they arrive.
-//
-// Called on refresh for saved rows and from the reason handler while editing;
-// it clears the tint as well as sets it, so emptying the field undoes it.
 window.apply_reason_highlight = function (frm, row) {
     let grid = (frm.fields_dict["material_allocation"] || {}).grid;
     let grid_row = grid && grid.grid_rows_by_docname[row.name];
@@ -622,23 +526,12 @@ window.apply_local_first_split = function (row) {
     row.global_allocated_qty = requested - row.local_allocated_qty;
 };
 
-// Untagged rows split LAB FIRST, into different fields, against a different
-// pool. Running the local-first splitter on one was actively wrong: local_free_qty
-// is 0 on an untagged row by construction, so the whole quantity landed in
-// global_allocated_qty - a TAGGED field - and the untagged split stayed empty.
-//
-// _lab_free / _main_free are stashed on the row by refresh_stock_available. They
-// are deliberately not fields: the server recomputes the split in
-// check_global_free_stock_limit on every save and discards whatever arrives, so
-// these exist only to keep the grid honest while the user is typing.
 window.apply_lab_first_split = function (row) {
     let requested = Math.max(parseFloat(row.allocate_qty) || 0, 0);
     let lab_free = Math.max(parseFloat(row._lab_free) || 0, 0);
 
     row.lab_allocated_qty = Math.min(requested, lab_free);
     row.main_allocated_qty = requested - row.lab_allocated_qty;
-    // An untagged row draws on neither tagged pool. Left non-zero, these would
-    // be read back as a tagged reservation.
     row.local_free_qty = 0;
     row.global_free_qty = 0;
     row.local_allocated_qty = 0;
@@ -747,9 +640,6 @@ window.refresh_stock_available = function (frm) {
         .then((data) => {
             let pr_po_map = data.message || {};
             items.forEach(function (row) {
-                // Untagged rows are measured against the untagged pile, never
-                // through free_stock_figures. Sending them down the tagged path
-                // is what replaced the builder's 51,300 with 9,850.
                 if ((row.source_pool || "Tagged") === "Untagged") {
                     window.refresh_untagged_row(frm, row, pr_po_map[row.item_code] || {});
                     return;
@@ -800,9 +690,6 @@ window.refresh_stock_available = function (frm) {
         });
 };
 
-// One untagged row refreshed against the untagged pool. Mirrors the tagged
-// branch of refresh_stock_available field for field, so the grid behaves the
-// same whichever pool a row came from.
 window.refresh_untagged_row = function (frm, row, pr_po) {
     frappe.call({
         method: "custom_batch_planning.custom_batch_planning.doctype.material_allocation.material_allocation.ma_get_untagged_free",
@@ -821,7 +708,6 @@ window.refresh_untagged_row = function (frm, row, pr_po) {
             let available = res.message.free_stock || 0;
             let qty_req = grid_row.doc.quantity_required || 0;
 
-            // Not fields - see apply_lab_first_split.
             grid_row.doc._lab_free = res.message.lab_free || 0;
             grid_row.doc._main_free = res.message.main_free || 0;
 
@@ -884,8 +770,6 @@ window.auto_allocate_all = function (frm) {
         (a, r) => a + parseFloat(r.global_allocated_qty || 0), 0
     );
 
-    // The allocation child rows carry their own field names; map them onto the
-    // shape render_shared_stock_table expects so both dialogs stay identical.
     let rows = shared.map((r) => ({
         item_code: r.item_code,
         item_name: r.item_name,
@@ -898,8 +782,6 @@ window.auto_allocate_all = function (frm) {
 
     let d = new frappe.ui.Dialog({
         title: __("⚠️ Shared Free Stock"),
-        // Five columns need the room — at the default 600px the item name wraps
-        // to three lines while the numeric columns sit half empty.
         size: "large",
         fields: [{ fieldtype: "HTML", fieldname: "shared_stock" }],
         primary_action_label: __("Continue"),
@@ -976,12 +858,6 @@ window.make_material_request = function (frm) {
         return;
     }
 
-    // Nothing is created here. The server returns an unsaved Material Request
-    // and this drops it into a new form, which is where Stage and Project
-    // Description get filled in - they are reqd on the doctype, so the form's
-    // own mandatory check collects them and Save is what turns it into a
-    // draft. Same shape as frappe.model.open_mapped_doc, called by hand
-    // because the source is a whitelisted doc method rather than a mapper.
     frm.call({
         doc: frm.doc,
         method: "make_material_request",

@@ -30,10 +30,10 @@ def _view(bp_main, other_main, bp_loc, bp_glob, oth_loc=0, oth_glob=0):
     pools = free_pools(bp_main, bp_loc, bp_glob, other_main, oth_loc, oth_glob)
     return {
         "global_main": other_main,
-        "global_allocated": oth_loc + bp_glob,      # other_allocated_total
+        "global_allocated": oth_loc + bp_glob,
         "global_free": pools["other_free"],
         "current_main": bp_main,
-        "current_allocated": bp_loc + bp_glob,      # bp_allocated, inclusive
+        "current_allocated": bp_loc + bp_glob,
         "current_free": pools["bp_free"],
         "bp_local": bp_loc,
         "other_global": oth_glob,
@@ -79,7 +79,7 @@ class TestScenario1LocalDraw(unittest.TestCase):
 
     def test_transfer_moves_main_and_clears_the_reservation(self):
         after_alloc = _view(100, 90, 40, 0)
-        after_xfer = _view(60, 90, 0, 0)  # 40 left the store; status -> Stock Entry Done
+        after_xfer = _view(60, 90, 0, 0)
 
         self.assertEqual(after_xfer["current_main"], 60, "Main Wh did not fall")
         self.assertEqual(after_xfer["current_allocated"], 0, "phantom hold survived")
@@ -92,7 +92,6 @@ class TestScenario1LocalDraw(unittest.TestCase):
         for v in (_view(100, 90, 0, 0), _view(100, 90, 40, 0), _view(60, 90, 0, 0)):
             self.assertTrue(_global_closes(v))
             self.assertTrue(_pool_invariant_holds(v))
-            # No borrowing anywhere, so the current line happens to close too.
             self.assertAlmostEqual(
                 v["current_main"], v["current_allocated"] + v["current_free"]
             )
@@ -128,8 +127,6 @@ class TestScenario2GlobalDraw(unittest.TestCase):
 
     def test_transfer_of_borrowed_stock_drains_the_lender(self):
         after_alloc = _view(0, 90, 0, 10)
-        # The Stock Entry is tagged to the borrower, so the issue lands as a
-        # negative on ITS line; settle_cross_batch_draw charges it to the lender.
         after_xfer = _view(-10, 90, 0, 0)
 
         self.assertEqual(after_xfer["global_main"], 80, "Main Wh did not fall for the lender")
@@ -146,8 +143,8 @@ class TestScenario3LegacyRowWithNoSplit(unittest.TestCase):
     """The shipped bug: both split columns 0 means the whole draw reads local."""
 
     def test_missing_split_hides_the_draw_from_the_global_pool(self):
-        correct = _view(0, 90, 0, 10)          # split recorded
-        legacy = _view(0, 90, 10, 0)           # _SOURCE_COLUMN falls back to local
+        correct = _view(0, 90, 0, 10)
+        legacy = _view(0, 90, 10, 0)
 
         self.assertEqual(correct["global_free"], 80)
         self.assertEqual(legacy["global_free"], 90, "precondition: the pool never moved")
@@ -163,8 +160,6 @@ class TestNetRequirement(unittest.TestCase):
     """Only the borrowed draw is credited; the local one is inside Total Stock."""
 
     def test_local_allocation_is_not_credited_twice(self):
-        # BOM 100, own main 40, lab 0, 40 reserved locally, 10 borrowed.
-        # Physically controlled: 40 own + 10 borrowed = 50.
         self.assertEqual(net_req(100, 40 + 0, 10), 50)
 
     def test_old_formula_understated_by_the_local_reservation(self):

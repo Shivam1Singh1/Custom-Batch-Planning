@@ -74,8 +74,6 @@ def run(apply=False):
         print("Nothing to backfill.")
         return
 
-    # Group per (allocation, item): several rows of one item share one pool and
-    # must drain it together, exactly as check_global_free_stock_limit does.
     grouped = {}
     for r in rows:
         grouped.setdefault((r.ma, r.item_code), []).append(r)
@@ -89,10 +87,6 @@ def run(apply=False):
             skipped.append((ma_name, item_code, "missing employee_function or project_id"))
             continue
 
-        # Resolved exactly as get_material_planning_data and
-        # MaterialAllocation.get_warehouse do — through the Employee Function's
-        # table_bukm rows — rather than by querying the child table directly,
-        # whose doctype name is not "Table BUKM".
         ef_doc = frappe.get_doc("Employee Function", head.employee_function)
         warehouse = next(
             (r.store_warehouse for r in (ef_doc.table_bukm or []) if r.store_warehouse),
@@ -118,8 +112,6 @@ def run(apply=False):
         )
 
         if split["shortfall"] > 0:
-            # Today's pools cannot cover what was reserved back then. Writing a
-            # split here would invent a source for units the pools do not have.
             skipped.append(
                 (ma_name, item_code,
                  f"shortfall {split['shortfall']} against today's pools")

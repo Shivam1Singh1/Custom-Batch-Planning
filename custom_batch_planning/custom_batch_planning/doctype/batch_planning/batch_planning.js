@@ -6,13 +6,6 @@ if (typeof XLSX === 'undefined') {
 
 const SLOT_ENDED_MSG = __("Slot period has ended — action not available");
 
-// Planning End Date of the linked Slot Master, or null when no Slot Master is
-// set. Six older Batch Plannings have none; a null end date must never block,
-// so callers treat null as "still open" rather than "expired".
-//
-// The date is not stored on Batch Planning, so it has to be fetched. Cached per
-// Slot Master because refresh() fires often and the value cannot change under
-// a submitted document.
 function resolve_slot_end_date(frm) {
     if (!frm.doc.custom_slot_master) return Promise.resolve(null);
     if (frm._slot_end_master === frm.doc.custom_slot_master) {
@@ -27,11 +20,6 @@ function resolve_slot_end_date(frm) {
         });
 }
 
-// Grey out a custom button and explain why on hover. A GROUPED button is an
-// <a> inside the Create dropdown, where prop('disabled') has no effect and the
-// click still fires — which is why every gated handler ALSO calls
-// slot_blocked() as its first statement. That guard, not this styling, is what
-// actually stops the action.
 function mark_slot_expired($btn) {
     $btn.prop('disabled', true)
         .attr('title', SLOT_ENDED_MSG)
@@ -48,12 +36,6 @@ function slot_blocked(slot_expired) {
     return true;
 }
 
-// Body markup for the "⚠️ Shared Free Stock" confirmation, rendered into the
-// dialog's HTML field. An identical copy lives in material_allocation.js — keep
-// the two in step; each form only loads its own doctype's script, so neither can
-// borrow the other's definition. Fixed column widths stop a long item code from
-// squeezing the four numeric columns into each other, and the header and total
-// rows stay pinned while the item list scrolls.
 window.render_shared_stock_table = function (opts) {
     let esc = function (v) {
         return frappe.utils.escape_html(v === null || v === undefined ? "" : String(v));
@@ -313,11 +295,6 @@ frappe.ui.form.on('Batch Planning', {
         if (frm.doc.docstatus === 1 || frm.doc.workflow_state === 'Approved') {
             render_bom_components_tab(frm);
 
-            // Button-driven, exactly like Material Planning. This used to render
-            // eagerly on every refresh() — and refresh() fires on save, on
-            // workflow action and on every route back to the form, so each one
-            // cost a full get_untagged_material_data round trip (50 items, four
-            // queries apiece) whether or not anyone opened the tab.
             if (frm._um_data && frm._um_data.length) {
                 render_untagged_materials_tab(frm);
             } else {
@@ -339,32 +316,6 @@ frappe.ui.form.on('Batch Planning', {
             render_stock_entry_tab(frm);
             render_item_issue_tab(frm);
 
-            // The gate is the linked Slot Master's Planning End Date. It
-            // REPLACES the old latest-slot_booking_date check: the booking rows
-            // and the master can disagree in both directions — BP-26-07-004
-            // books a week past its master's end, BP-26-06-004's master runs a
-            // week past its last booking — and the master is the document that
-            // actually defines the period.
-            //
-            // Run Material Planning is gated too, on the same date. A batch
-            // whose slot closed in August has nothing left to plan in
-            // September: every figure it would fetch describes a period that is
-            // over, and re-running it only invites someone to act on a stale
-            // requirement. This reverses the earlier decision to exempt it —
-            // the exemption existed to keep an expired batch readable, and the
-            // cost of that is spelled out below.
-            //
-            // READABILITY COST, ACCEPTED. The tab only auto-renders when
-            // frm._mp_data is already populated, which happens once the button
-            // has been pressed in THIS session (nothing writes the localStorage
-            // key it looks for). So on a fresh load of an expired batch the
-            // figures can no longer be brought up at all. The placeholder is
-            // swapped for one that says the slot closed, rather than leaving it
-            // inviting a click the guard will refuse.
-            //
-            // Buttons are removed inside the callback rather than before the
-            // fetch, so two refreshes in flight at once cannot leave a
-            // duplicate pair behind.
             resolve_slot_end_date(frm).then(function (end_date) {
                 let today = frappe.datetime.str_to_obj(frappe.datetime.get_today());
                 let slot_expired = !!end_date
@@ -378,8 +329,6 @@ frappe.ui.form.on('Batch Planning', {
 
                 let $um_btn = frm.add_custom_button(__("Run Untagged Materials"), function () {
                     if (slot_blocked(slot_expired)) return;
-                    // force: the button is the one place that should go back to
-                    // the server. Everywhere else repaints what is already held.
                     render_untagged_materials_tab(frm, true);
                 });
                 if (slot_expired) {
@@ -395,10 +344,6 @@ frappe.ui.form.on('Batch Planning', {
                 }).addClass("btn-primary");
                 if (slot_expired) {
                     mark_slot_expired($mp_btn);
-                    // The placeholder was rendered before this promise resolved,
-                    // so it still reads "Click Run Material Planning above" next
-                    // to a button that will now refuse. Only replace it when the
-                    // table is not already on screen from an earlier run.
                     if (!(frm._mp_data && frm._mp_data.length)) {
                         render_material_planning_placeholder(frm, true);
                     }
@@ -444,11 +389,6 @@ frappe.ui.form.on('Batch Planning', {
                                                 child.global_free_qty = row.global_free_qty;
                                                 child.local_allocated_qty = row.local_allocated_qty;
                                                 child.global_allocated_qty = row.global_allocated_qty;
-                                                // Set server-side when lab stock trimmed the
-                                                // allocation. Material Allocation.validate makes
-                                                // Reason mandatory whenever Qty Requested differs
-                                                // from BOM Qty, so dropping it here would block
-                                                // the save on a deviation the system chose.
                                                 child.reason = row.reason;
                                             });
                                         }
@@ -465,9 +405,6 @@ frappe.ui.form.on('Batch Planning', {
 
                             let d = new frappe.ui.Dialog({
                                 title: __("⚠️ Shared Free Stock"),
-                                // Five columns need the room — at the default
-                                // 600px the item name wraps to three lines while
-                                // the numeric columns sit half empty.
                                 size: "large",
                                 fields: [{ fieldtype: "HTML", fieldname: "shared_stock" }],
                                 primary_action_label: __("Continue"),
@@ -492,27 +429,6 @@ frappe.ui.form.on('Batch Planning', {
                 }, __("Create"));
                 if (slot_expired) mark_slot_expired($alloc_btn);
 
-                // Bulk allocation against the untagged pool.
-                //
-                // Sits under Create, directly beside the tagged "Material
-                // Allocation" it parallels — the two build the same document
-                // from different stock, so they belong in the same menu.
-                //
-                // The label must stay distinct from "Material Allocation".
-                // frm.remove_custom_button matches on (label, group), so two
-                // entries sharing a label in one group would collide on every
-                // rebuild — and they draw on completely different stock under
-                // different accounting, which the menu has to make obvious.
-                //
-                // ALWAYS AVAILABLE, deliberately. An earlier version hid this
-                // until Run Untagged Materials had populated the tab, reasoning
-                // that nobody should commit fifty rows against figures they had
-                // not looked at. That guard protected nothing:
-                // create_untagged_material_allocation re-runs the untagged query
-                // server-side on every click and never reads the browser's copy,
-                // so the draft is built from live figures whether or not the tab
-                // was ever painted. All the gate achieved was hiding the entry
-                // from anyone who had not visited the tab first.
 
                 let $ua_btn = frm.add_custom_button(__("Allocate Untagged Materials"), function () {
                     if (slot_blocked(slot_expired)) return;
@@ -524,12 +440,6 @@ frappe.ui.form.on('Batch Planning', {
                         callback: function (r) {
                             if (!r.message) return;
 
-                            // No skipped-items popup. The draft that opens is
-                            // itself the answer: the rows present are what can be
-                            // allocated, and an interstitial listing what is
-                            // absent made every click a two-step. The server
-                            // still returns r.message.warning, so it can be
-                            // surfaced somewhere non-blocking if it is wanted.
                             frappe.model.with_doctype("Material Allocation", function () {
                                 let new_doc = frappe.model.get_new_doc("Material Allocation");
                                 new_doc.batch_planning = r.message.batch_planning;
@@ -546,19 +456,9 @@ frappe.ui.form.on('Batch Planning', {
                                     child.quantity_required = row.quantity_required;
                                     child.allocate_qty = row.allocate_qty;
                                     child.stock_available = row.stock_available;
-                                    // The field that routes every downstream
-                                    // figure to the untagged pile. Drop it and
-                                    // these rows go through free_stock_figures
-                                    // instead, which measures stock they did
-                                    // not come from and would reject them.
                                     child.source_pool = row.source_pool;
                                     child.lab_allocated_qty = row.lab_allocated_qty;
                                     child.main_allocated_qty = row.main_allocated_qty;
-                                    // Server-set wherever the pool covers less
-                                    // than the BOM quantity, which is the normal
-                                    // case here. validate makes Reason mandatory
-                                    // on any such row, so dropping it would block
-                                    // the save on a deviation the system chose.
                                     child.reason = row.reason;
                                 });
 
@@ -856,25 +756,8 @@ frappe.ui.form.on('Batch Planning', {
     },
 
     before_save: function (frm) {
-        // Last point at which the local name is still readable; after_save needs it
-        // to move BOM edits stored against it onto the name the server assigns.
         if (frm.is_new()) frm._local_name = frm.doc.name;
 
-        // The batch_type trigger assigns batch_planning_id through an async
-        // frappe.call chained onto frm._counter_queue. Nothing used to wait for
-        // it, so a quick save reached the server with the field still empty --
-        // and validate() then stamped it with a SECOND, incompatible format
-        // (BC-29-08-001 instead of SO-26-08-006-MFG-01). See the server-side
-        // guard that replaced that fallback in batch_planning.py.
-        //
-        // Returning a promise from before_save makes frm.save() await it, so the
-        // document is never sent until every row carries its id. Rows the trigger
-        // never fired for are filled in here.
-        //
-        // Sequential via reduce, NOT Promise.all: get_next_batch_counter is
-        // MAX-based, so each new id has to be visible to the next call through
-        // exclude_ids. Fired concurrently, two rows of the same batch type would
-        // both compute the same MAX+1 and collide.
         let queue = frm._counter_queue || Promise.resolve();
 
         return queue.then(function () {
@@ -885,9 +768,6 @@ frappe.ui.form.on('Batch Planning', {
 
             return pending.reduce(function (chain, row) {
                 return chain.then(function () {
-                    // Identity rather than name comparison, matching the server
-                    // guard: a row that fails to exclude itself hands the same
-                    // number back on the next call.
                     let assigned = (frm.doc.custom_batch_details || [])
                         .filter(r => r.batch_planning_id && r !== row)
                         .map(r => r.batch_planning_id);
@@ -912,11 +792,6 @@ frappe.ui.form.on('Batch Planning', {
     },
 
     after_save: function (frm) {
-        // BOM edits made before the first save are filed under the throwaway local
-        // name, so they have to be moved onto the real one. Match on the name this
-        // form actually had: the previous filter looked for `new-batch-creation-%`,
-        // which Frappe never generates for this doctype, so every such edit was
-        // stranded and the dialog fell back to the source BOM on reopen.
         let local_name = frm._local_name;
         frm._local_name = null;
 
@@ -999,12 +874,6 @@ frappe.ui.form.on('Batch Planning Detail', {
                             return;
                         }
 
-                        // Chained, not fired side by side. Setting finished_item runs
-                        // the row's own finished_item trigger, which blanks bom_list.
-                        // Both set_values used to be issued without waiting, so that
-                        // blanking could land after the BOM was written and leave the
-                        // row carrying no BOM -- which is how a row reaches Approved
-                        // with an empty Bom List while its siblings are filled in.
                         frappe.model
                             .set_value(cdt, cdn, 'finished_item', frm.doc.finished_item)
                             .then(function () {
@@ -1101,8 +970,6 @@ function open_bom_dialog(frm, cdt, cdn, bom_name, batch_type) {
         return;
     }
 
-    // One call: the server picks the newest store row for this key, so a duplicate
-    // left behind by an older save can no longer shadow the current edit.
     frappe.call({
         method: 'custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_batch_bom_store',
         args: { batch_key: batch_key },
@@ -1193,9 +1060,6 @@ function render_bom_dialog(frm, cdt, cdn, bom_name, batch_type, is_readonly, fin
                 return;
             }
 
-            // Recompute rather than trust the key the dialog opened with: the form
-            // may have been saved in the meantime, which renames the document and
-            // moves the store row along with it.
             let row_data = locals[cdt] && locals[cdt][cdn];
             let save_key = (frm.doc.name && row_data && row_data.idx)
                 ? `${frm.doc.name}-${row_data.idx}`
@@ -1658,10 +1522,6 @@ function inject_eye_buttons_once(frm, $grid_wrapper) {
         let rd = locals['Batch Planning Detail'] &&
             locals['Batch Planning Detail'][row_name];
 
-        // The static grid column only. An unqualified [data-fieldname] lookup also
-        // matches the frappe-control rendered inside this cell's .field-area (and
-        // the one in the expanded row form), so appending to the whole set puts a
-        // second eye in the row the moment it is made editable.
         let $bom_cell = $row.find('.grid-static-col[data-fieldname="bom_list"]').first();
         if (!$bom_cell.length) return;
 
@@ -1675,8 +1535,6 @@ function inject_eye_buttons_once(frm, $grid_wrapper) {
 
         bom_val = bom_val.trim();
 
-        // Sweep the whole row, not just the target cell, so any stray button that
-        // landed in the editable control is cleared out too.
         $row.find('.bom-eye-btn').remove();
 
         if (!bom_val) return;
@@ -1789,21 +1647,6 @@ function render_bom_components_tab(frm) {
     });
 }
 
-// Untagged Materials — the same items as Material Planning, measured against
-// stock and pipeline that carry NO batch tag. Amber throughout rather than the
-// planning tab's green, so a screenshot of one is never mistaken for the other:
-// the two tabs show the same item codes with deliberately different numbers.
-// force=true fetches; anything else paints the payload already in hand.
-//
-// WHY THE SPLIT. refresh() fires on save, on workflow action and on every route
-// back to the form, and it re-entered this function each time. Once the button
-// had been pressed that meant a fresh 50-item round trip per refresh, each one
-// replacing the finished table with the spinner again — so a tab that renders
-// in about a second looked like it was hanging indefinitely. Only the button
-// fetches now; refresh() repaints from memory.
-//
-// An in-flight guard sits on top of that: double-clicking the button used to
-// start a second request whose spinner overwrote the first one's result.
 function render_untagged_materials_tab(frm, force) {
     let $field = frm.fields_dict["untagged_material_html"];
     if (!$field) return;
@@ -1826,9 +1669,6 @@ function render_untagged_materials_tab(frm, force) {
     frappe.call({
         method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_untagged_material_data",
         args: { doc_name: frm.doc.name },
-        // Without this, ANY failure left the spinner turning forever with
-        // nothing said — the failure mode is indistinguishable from slowness,
-        // which is exactly how a broken call gets reported as "taking too long".
         error: function (e) {
             frm._um_loading = false;
             let detail = (e && (e.message || (e.exc_type || ""))) || "";
@@ -1854,8 +1694,6 @@ function render_untagged_materials_tab(frm, force) {
     });
 }
 
-// Pure render: takes the payload, paints the tab, makes no server call. Split
-// out of render_untagged_materials_tab so a refresh can repaint instantly.
 function paint_untagged_materials(frm, message) {
     let $field = frm.fields_dict["untagged_material_html"];
     if (!$field) return;
@@ -1931,12 +1769,6 @@ function paint_untagged_materials(frm, message) {
                     </tr>`;
             }).join("");
 
-            // Kept for the pre-allocation state only. The server now sends
-            // allocation_pending false, so this renders nothing — but the flag
-            // stays wired up rather than being deleted, because it is the one
-            // switch that distinguishes "nothing is reserved" from "nothing CAN
-            // be reserved", and conflating those is exactly what the note exists
-            // to prevent.
             let pending_note = allocation_pending
                 ? `<div style="margin-top:8px; padding:8px 12px; background:#d1fae5; border:1px solid #86efac; border-radius:6px; font-size:11px; color:#14532d;">
                        <b>Allocation not yet available for untagged stock.</b> Both Allocated lines read 0 because no reservation can be made against this pool yet — so Free Qty currently equals Main Wh, and Lab Wise (After Alloc) equals Lab Wise (Existing).
@@ -1986,10 +1818,6 @@ function paint_untagged_materials(frm, message) {
             $field.$wrapper.html(html);
 }
 
-// Amber to match the tab it fills, and gated the same way Material Planning's
-// placeholder is: slot_expired swaps the call to action for an explanation,
-// so a closed batch does not show "Click Run Untagged Materials above" beside
-// a button that will refuse.
 function render_untagged_materials_placeholder(frm, slot_expired) {
     let $field = frm.fields_dict["untagged_material_html"];
     if (!$field) return;
@@ -2014,20 +1842,6 @@ function render_untagged_materials_placeholder(frm, slot_expired) {
     `);
 }
 
-// ---------------------------------------------------------------------------
-// Shared table cell renderers.
-//
-// These were local to render_material_planning_tab's callback until the
-// Untagged Materials tab needed the identical formatting. Lifted rather than
-// copied deliberately: two divergent copies of the same quantity calculation is
-// exactly how the Qty Req scale bug happened, and the same trap applies to the
-// number FORMATTING that decides whether a figure reads as "0", "-" or
-// "pending".
-//
-// Pure functions of their arguments — no frm, no closure state — so both tabs
-// get identical output for identical input, which is the property being
-// protected.
-// ---------------------------------------------------------------------------
 
 const PENDING_HINT = "Pending until the stock cutover go-live marker is set in Batch Planning Settings.";
 
@@ -2036,23 +1850,10 @@ const GRN_SECTIONS = {
     bp: "Local Unapproved GRN — receipts tagged to the CURRENT BATCH, waiting on Store Head approval.",
 };
 
-// Header cells are sticky, so they need their OWN background: a sticky <th>
-// paints over scrolled rows, and the colour set on the parent <tr> does not
-// travel with it — without this the row text shows straight through the header.
-// The bottom rule is a box-shadow rather than a border for the same reason;
-// borders on sticky cells detach and scroll away in Chrome.
 function th_style(align = "center") {
     return `padding:11px 10px; text-align:${align}; color:#166534; font-weight:700; font-size:10px; text-transform:uppercase; white-space:nowrap; background:#f3f4f6; position:sticky; top:0; z-index:3; box-shadow: inset 0 -2px 0 #86efac;`;
 }
 
-// Scroll shell shared by both data tables. Injected per table rather than once
-// globally because each tab renders independently and neither can rely on the
-// other having run first; duplicate identical rules are harmless.
-//
-// overflow-x is `scroll`, not `auto`, deliberately — on Windows the auto
-// scrollbar stays hidden until a scroll gesture starts, so a table wider than
-// its container gives no visual hint that there are more columns off to the
-// right. Forcing the track to render is the whole point.
 function table_scroll_styles() {
     return `
         <style>
@@ -2099,7 +1900,6 @@ function pipeline_line(qty, count, docs, doctype, color, label) {
         >${format_qty_val(n)} (${c})</span></div>`;
 }
 
-// Two stacked lines, keyed gen_<stage>_* over bp_<stage>_*.
 function pipeline_cell(row, stage, doctype, labels) {
     labels = labels || {};
     return `
@@ -2110,8 +1910,6 @@ function pipeline_cell(row, stage, doctype, labels) {
     `;
 }
 
-// Single-line variant for the Untagged tab, which has one pool and so one
-// figure per pipeline stage rather than a Global/Current pair.
 function pipeline_cell_single(row, stage, doctype, color) {
     return `
         <td style="padding:7px 10px; text-align:center; font-weight:700; font-size:12px; white-space:nowrap;">
@@ -2140,42 +1938,13 @@ function stock_cell(global_qty, bp_qty) {
     `;
 }
 
-// Shared layout for both drill-down dialogs.
-//
-// A responsive tile GRID, not a vertical table: five lab warehouses stacked as
-// table rows produced a tall, narrow dialog that used almost none of the width
-// available to it. auto-fit + minmax spends the width instead and reflows on
-// its own as the dialog or viewport changes — no breakpoints, no media queries,
-// and it behaves the same for three tiles or thirty.
-//
-// Zero tiles are kept but drained of colour. "Checked, holds nothing" and "not
-// looked at" are different statements, and only the first is useful when the
-// point of the panel is to verify a sum.
-// Plain two-column list: label left, quantity right-aligned, reconciliation
-// totals as footer rows in the SAME table so they line up under the figures they
-// sum.
-//
-// Replaced a card grid. Five lab warehouses became five tiles across a row, the
-// zero ones were as visually loud as the live ones, and the total sat in a
-// separate bar well away from the numbers it was supposed to reconcile — which
-// is the one job this drill-down has.
-//
-// Uses Frappe's own table classes rather than inline styling, so it follows the
-// desk theme. The only inline style is the horizontal scroll wrapper, which
-// keeps long warehouse names from widening the dialog.
 function breakdown_list(rows, opts) {
     opts = opts || {};
     let esc = frappe.utils.escape_html;
 
-    // Second label column, used by the Main Wh drill-down to carry the project
-    // name beside its id. Omitted entirely when nothing supplies one, so the lab
-    // drill-down stays two columns rather than growing an empty third.
     let has_sub = !!opts.sublabel;
     let cols = has_sub ? 3 : 2;
 
-    // Green, matching the Material Planning palette the tab now uses. Confined
-    // to the header and total rows: the body stays plain so the figures are what
-    // the eye lands on.
     let head_bg = "background:#d1fae5; color:#14532d;";
 
     let body = (rows || []).map(function (r) {
@@ -2211,14 +1980,6 @@ function breakdown_list(rows, opts) {
         </div>`;
 }
 
-// Lab Item drill-down. Global because the table is built as an HTML string and
-// its onclick handlers are inline, so there is no closure to reach into.
-//
-// A DIALOG rather than a route to Stock Ledger or Bin, deliberately: neither of
-// those reports can filter on batch_planning_id, so both would show tagged and
-// untagged stock together and contradict the very figure this is explaining.
-// The dialog calls the same _stock_qty path the row total came from, so the
-// parts always add up to the whole.
 window.cbp_show_lab_breakdown = function (doc_name, item_code) {
     frappe.call({
         method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_untagged_lab_breakdown",
@@ -2258,11 +2019,6 @@ window.cbp_show_lab_breakdown = function (doc_name, item_code) {
                         totals: (parseFloat(d.allocated) || 0) > 0
                             ? [
                                 { label: "Gross untagged lab stock", qty: d.total },
-                                // Pool-wide, NOT this batch's Labware figure.
-                                // Lab Item is net of every batch's untagged
-                                // claim, so naming Labware here pointed at a
-                                // column that reads 0 whenever the claim
-                                // belongs to a different Batch Planning.
                                 { label: "Less allocated to this function's batches", qty: d.allocated },
                                 { label: "Available — matches Lab Item on the row", qty: d.available },
                               ]
@@ -2275,8 +2031,6 @@ window.cbp_show_lab_breakdown = function (doc_name, item_code) {
     });
 };
 
-// Lab Item's own line: same dotted-underline affordance as pipeline_line, so a
-// drillable number looks drillable wherever it appears.
 function lab_item_line(qty, doc_name, item_code) {
     let n = parseFloat(qty || 0);
     let color = n > 0 ? "#7c3aed" : "#d1d5db";
@@ -2295,13 +2049,6 @@ function main_wh_line(qty, doc_name, item_code) {
         >${format_qty_val(n)}</span>`;
 }
 
-// Main Wh drill-down: this function's store stock split by Project, plus the
-// same item in other functions' stores as context.
-//
-// The two sections are kept apart on purpose. The first totals to the Main Wh
-// figure on the row and is the reconciliation; the second is other people's
-// stock and must never be added to it, or the drill-down would contradict the
-// number it exists to explain.
 window.cbp_show_main_breakdown = function (doc_name, item_code) {
     frappe.call({
         method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_untagged_main_breakdown",
@@ -2339,13 +2086,6 @@ window.cbp_show_main_breakdown = function (doc_name, item_code) {
                 }
             );
 
-            // The explanatory paragraph is gone and the table takes the space.
-            // It said the same thing on every open, repeated the warehouse
-            // already in the dialog title, and printed the Employee Function
-            // twice over on this site because the function is named after its
-            // own store. The exclusion it described - batch-tagged units are not
-            // counted - is the defining property of the whole tab, stated in its
-            // header, not something this dialog needs to restate.
             dlg.fields_dict.breakdown.$wrapper.html(grid);
             dlg.show();
         },
@@ -2500,9 +2240,6 @@ function render_material_planning_tab(frm) {
     });
 }
 
-// slot_expired swaps the call to action for an explanation. Without it an
-// expired batch showed "Click Run Material Planning above" beside a greyed-out
-// button, which reads as a broken form rather than a closed slot.
 function render_material_planning_placeholder(frm, slot_expired) {
     let $field = frm.fields_dict["material_planning_html"];
     if (!$field) return;

@@ -32,8 +32,6 @@ function render_bom_items(frm) {
 			}
 
 			let batch_key = `${frm.doc.batch_planning}-${matched.idx}`;
-			// Server side so the newest store row wins; the table can carry more than
-			// one row per key from the days the dialog inserted client side.
 			frappe.call({
 				method: "custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning.get_batch_bom_store",
 				args: { batch_key: batch_key },

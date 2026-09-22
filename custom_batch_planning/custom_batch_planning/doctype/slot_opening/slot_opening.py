@@ -72,13 +72,6 @@ def get_slot_opening_usage(slot_opening=None):
     if not bookings:
         return []
 
-    # Keyed on str(date), not the raw value, because the two sides of this
-    # comparison are different types. Slot Booking CT.slot_booking_date is a
-    # Date, so it arrives as datetime.date; Batches Planned.slot_booking_date
-    # is a Data field holding 'YYYY-MM-DD', so it arrives as str. A dict keyed
-    # on the raw values never matched: planned stayed 0 for every date,
-    # remaining always came back equal to booked, and the Create Batch button
-    # stayed on screen no matter how much of the opening had been planned.
     used = {
         str(date): int(count or 0)
         for date, count in (

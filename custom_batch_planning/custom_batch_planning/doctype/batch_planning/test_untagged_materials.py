@@ -51,10 +51,6 @@ class TestUntaggedPredicate(unittest.TestCase):
             sql = _bp_predicate(alias, "UNTAGGED", expr)
             self.assertIn(f"{alias}.batch_planning_id", sql)
             self.assertIn(f"{parent}.custom_batch_planning_no", sql)
-            # NOT the bare custom_batch_planning. It is defined on no doctype
-            # and exists only as an orphan column on databases old enough to
-            # predate its rename, so naming it made every untagged query a 1054
-            # everywhere else. This assertion used to require it.
             self.assertNotIn(f"{parent}.custom_batch_planning,", sql)
             self.assertTrue(sql.endswith("IS NULL"), sql)
 
@@ -76,7 +72,6 @@ class TestUntaggedPredicate(unittest.TestCase):
         bp = _bp_predicate("sle", "BP")
         untagged = _bp_predicate("sle", "UNTAGGED")
 
-        # GEN and BP both require a non-null tag; UNTAGGED requires its absence.
         self.assertIn("IS NOT NULL", gen)
         self.assertIn("IS NULL", untagged)
         self.assertNotIn("IS NULL", gen)
@@ -151,8 +146,6 @@ class TestUntaggedMaterialDataLive(unittest.TestCase):
         out = get_untagged_material_data(name)
         self.assertIn("results", out)
         self.assertTrue(out["warehouse"])
-        # Untagged stock became reservable on 2026-09-07; the flag exists to say
-        # "nothing CAN be reserved", which is no longer true.
         self.assertFalse(out["allocation_pending"])
 
         for row in out["results"]:
@@ -184,15 +177,10 @@ class TestUntaggedMaterialDataLive(unittest.TestCase):
                 r["total_stock"], r["main_stock"] + r["lab_stock"], places=1,
                 msg=f"Total Stock != Main + Lab on {r['item_code']}",
             )
-            # Lab is credited from 2026-09-07: every untagged unit is available
-            # wherever it sits until something reserves it.
             self.assertAlmostEqual(
                 r["free_qty"], r["total_stock"] - r["global_allocated"], places=1,
                 msg=f"Free Qty != Total Stock - Allocated(Global) on {r['item_code']}",
             )
-            # Only the MAIN-sourced share is added. Lab-sourced allocation moves
-            # nothing, and those units are already inside lab_stock, so adding
-            # the whole reservation would count them twice.
             self.assertAlmostEqual(
                 r["lab_after_alloc"],
                 r["lab_stock"] + r["current_main_allocated"], places=1,
@@ -202,39 +190,20 @@ class TestUntaggedMaterialDataLive(unittest.TestCase):
                 r["current_main_allocated"], r["current_allocated"] + 1e-6,
                 msg=f"Main-sourced share exceeds the whole draw on {r['item_code']}",
             )
-            # The symbolic lab_item -> Labware move: what Lab Item gives up, the
-            # pool takes, and the gross figure Total Stock reconciles against is
-            # untouched by it.
-            #
-            # Against lab_allocated_global, NOT labware_qty. Lab Item is net of
-            # every batch's untagged claim on this pool, while Labware reports
-            # only the claim THIS batch made — so the two balance solely on the
-            # plan that made the allocation. Asserting on labware_qty here would
-            # demand that no other batch ever holds a claim, which failed the
-            # moment one 2-unit draw on BP-26-10-001 left the other thirteen
-            # plans under VP-LTP-MFG-001 with Lab Item 19 against gross 21.
             self.assertAlmostEqual(
                 r["lab_available"] + r["lab_allocated_global"], r["lab_stock"],
                 places=1,
                 msg=f"Lab Item + pool lab claim != gross lab stock on {r['item_code']}",
             )
-            # The Allocated column dropped its lab half. Nothing was lost in the
-            # move: the two still account for the whole reservation — at pool
-            # scope, which is what global_main_allocated was derived from.
             self.assertAlmostEqual(
                 r["global_main_allocated"] + r["lab_allocated_global"],
                 r["global_allocated"], places=1,
                 msg=f"Allocated + pool lab claim != total reservation on {r['item_code']}",
             )
-            # Labware is this batch's own draw, so it can never exceed the
-            # pool-wide claim it is a share of. This is the assertion that would
-            # have caught the leak: under the old global figure the two were
-            # equal by construction and nothing could ever fail.
             self.assertLessEqual(
                 r["labware_qty"], r["lab_allocated_global"] + 1e-6,
                 msg=f"Labware exceeds the pool-wide lab claim on {r['item_code']}",
             )
-            # And the row still reads straight across.
             self.assertAlmostEqual(
                 r["main_stock"] + r["lab_available"] - r["global_main_allocated"],
                 r["free_qty"], places=1,
@@ -375,7 +344,7 @@ class TestUntaggedLabStockIsEmployeeFunctionScoped(unittest.TestCase):
         for item, per_ef in shared.items():
             values = set(round(v, 2) for v in per_ef.values())
             if len(values) > 1:
-                return          # at least one item discriminates — fix holds
+                return
 
         self.fail(
             "Untagged Total Stock is identical across every Employee Function "

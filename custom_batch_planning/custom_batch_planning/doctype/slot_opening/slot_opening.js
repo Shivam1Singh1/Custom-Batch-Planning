@@ -1,15 +1,5 @@
 frappe.ui.form.on("Slot Opening", {
 	onload: function (frm) {
-		// A new doc already carrying employee_function got it from the
-		// frappe.new_doc() handoff on Slot Master List. form.js replays every
-		// populated Link field through trigger_link_fields() once the form is up,
-		// which fires the handler below and clears the rest of that handoff. Arm
-		// the guard so the replay is skipped exactly once.
-		//
-		// Only when the value arrived with the doc: on a blank Slot Opening the
-		// replay never fires, so an unconditional flag would instead swallow the
-		// user's own first pick -- and set_project_filter() would never re-run,
-		// leaving Project stuck behind the empty filter onload installed.
 		if (frm.is_new() && frm.doc.employee_function) {
 			frm.__skip_ef_clear_once = true;
 		}

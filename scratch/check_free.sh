@@ -1,1 +1,0 @@
-mysql -u _3da86d1069214b38 -piM1iO8aYvzt60bHH _3da86d1069214b38 -e "SELECT SUM(actual_qty), employee_function FROM \`tabStock Ledger Entry\` WHERE item_code='CN02010004' AND (batch_planning_id IS NULL OR batch_planning_id = '') AND is_cancelled=0 GROUP BY employee_function;"
