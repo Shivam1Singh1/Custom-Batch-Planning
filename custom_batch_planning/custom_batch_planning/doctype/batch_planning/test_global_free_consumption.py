@@ -1,20 +1,3 @@
-"""Global Free Qty must fall when an allocation draws on the global pool.
-
-The bug this pins: a batch with no stock of its own allocated 10 out of the
-shared pool, and Global Free Qty stayed where it was. The reservation was
-charged to the borrower's own tagged stock — where the units had never been —
-so the global pool still offered them and the same 10 could be taken again.
-
-Two layers are covered:
-
-  * free_pools()        the rule itself, as pure arithmetic
-  * a real allocation   inserted, checked, deallocated and rolled back, which
-                        proves the rule survives the whole save path
-
-Run:  bench --site <site> run-tests --app custom_batch_planning \
-          --module custom_batch_planning.custom_batch_planning.doctype.batch_planning.test_global_free_consumption
-"""
-
 import unittest
 
 import frappe
@@ -36,18 +19,12 @@ def _pools(
     other_alloc=0,
     other_global_alloc=0,
 ):
-    """free_pools in the shape the acceptance tests are written in.
-
-    other_alloc is other batches' LOCAL draws (against their own stock);
-    other_global_alloc is their borrowings, which come out of this batch's.
-    """
     return free_pools(
         bp_main, local_alloc, global_alloc, other_main, other_alloc, other_global_alloc
     )
 
 
 class TestGlobalFreeConsumption(unittest.TestCase):
-    """Sections 5-8 and 18 of the spec, one test per numbered scenario."""
 
     def test_1_local_zero_global_allocation_reduces_global_free(self):
         split = split_local_first([10], 0, 90)["rows"][0]
@@ -152,14 +129,6 @@ class TestGlobalFreeConsumption(unittest.TestCase):
 
 
 class TestTransferOutOfBorrowedStock(unittest.TestCase):
-    """Main Wh must fall when borrowed stock is moved to Lab.
-
-    The Stock Entry tags its issue with the batch that CONSUMED the material,
-    while the receipt carries the batch that BOUGHT it — so a borrowed transfer
-    leaves a negative on one line and the full quantity on the other, and the
-    negative is clamped away on screen. Main Wh read 9,950 after 50 units had
-    left the store.
-    """
 
     def test_borrower_deficit_is_charged_to_the_pile_it_came_from(self):
         bp_main, other_main = settle_cross_batch_draw(-50, 9950)
@@ -201,13 +170,11 @@ class TestTransferOutOfBorrowedStock(unittest.TestCase):
 
 
 class TestGlobalFreeConsumptionLive(unittest.TestCase):
-    """The same rule through a real Material Allocation, then rolled back."""
 
     def tearDown(self):
         frappe.db.rollback()
 
     def _candidate(self):
-        """An item on a submitted Batch Planning with global free stock to borrow."""
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning_settings.batch_planning_settings import (
             get_stock_cutover_datetime,
         )
@@ -303,15 +270,6 @@ class TestGlobalFreeConsumptionLive(unittest.TestCase):
         )
 
     def test_both_pools_balance_against_real_data(self):
-        """Each pile equals what is free in it plus what was reserved out of it.
-
-        The invariant that ties every column together, and the one the old
-        arithmetic broke: a borrowed unit used to be missing from one side and
-        double-counted on the other.
-
-            other_main = other_free + their local draws + my borrowings
-            bp_main    = bp_free    + my local draws    + their borrowings
-        """
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning_settings.batch_planning_settings import (
             get_stock_cutover_datetime,
         )
@@ -363,7 +321,6 @@ class TestGlobalFreeConsumptionLive(unittest.TestCase):
         self.assertGreater(checked, 0, "no planning rows available to check")
 
     def test_a_request_beyond_the_live_pools_is_rejected_and_changes_nothing(self):
-        """Section 15 / TEST 5: the server re-reads the pools and refuses."""
         bp, ef, warehouse, item_code, before = self._candidate()
         if not bp:
             self.skipTest("no item on this site currently has global free stock to borrow")

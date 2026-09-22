@@ -2,15 +2,6 @@ import frappe
 from custom_batch_planning.api.pr_integration import consolidate_items_table
 
 def validate_purchase_order(doc, method):
-    """
-    Consolidate identical items (by item_code) and carry the single/multiple
-    custom_batch_planning_no from the linked Material Request or child items
-    to the parent Purchase Order header.
-
-    Rules (simplified design):
-    - Parent PO carries custom_batch_planning_no.
-    - Item-level batch fields (custom_batch_reference) are NOT written.
-    """
 
     consolidate_items_table(doc)
 

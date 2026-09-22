@@ -1,10 +1,6 @@
 import frappe
 
 def set_batch_planning_id_on_po(doc, method):
-    """
-    When PO is created from MR, copy batch_planning_id
-    from MR Item to PO Item.
-    """
     for item in doc.items:
         if item.batch_planning_id:
             continue
@@ -19,10 +15,6 @@ def set_batch_planning_id_on_po(doc, method):
                 item.batch_planning_id = bp_id
 
 def set_batch_planning_id_on_grn(doc, method):
-    """
-    When GRN is created from PO, copy batch_planning_id
-    from PO Item to GRN Item.
-    """
     for item in doc.items:
         if item.batch_planning_id:
             continue

@@ -1,5 +1,6 @@
 frappe.ui.form.on("Slot Opening", {
 	onload: function (frm) {
+
 		if (frm.is_new() && frm.doc.employee_function) {
 			frm.__skip_ef_clear_once = true;
 		}

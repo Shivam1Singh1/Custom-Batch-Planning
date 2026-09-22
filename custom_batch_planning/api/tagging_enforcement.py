@@ -1,19 +1,3 @@
-"""Mandatory Employee Function + Project tagging, from the cutover onward.
-
-One validator, four call sites. The alternative — a bespoke check written into
-each doctype — rots the moment somebody adds a fifth entry point, because the
-new doctype is unguarded by default and nothing says so. Here, adding a doctype
-means adding a row to DOC_DATE_FIELDS and TAGGING_FIELDS, and forgetting to do
-that leaves the doctype visibly absent from a table rather than invisibly
-unprotected.
-
-Everything downstream depends on this holding. Global Main Wh, Global Free Qty
-and eventually Net Req are all scoped to `posting_datetime >= cutover AND
-employee_function = EF AND project = P`. That scoping is only meaningful if no
-untagged row can be created after the cutover — one bypass and the pool
-silently under-counts again, which is the problem the cutover exists to end.
-"""
-
 import frappe
 from frappe.utils import get_datetime, getdate
 
@@ -62,7 +46,6 @@ TAGGING_FIELDS = {
 
 
 def _value(source, fieldnames):
-    """First non-blank value among fieldnames, treating whitespace as blank."""
     for fieldname in fieldnames:
         value = source.get(fieldname)
         if isinstance(value, str):
@@ -73,20 +56,6 @@ def _value(source, fieldnames):
 
 
 def is_post_cutover(doc, cutover):
-    """Whether this document falls under the post-cutover tagging regime.
-
-    Date-only doctypes (MR, PO) are compared on the DATE alone, not against the
-    cutover's time of day. If the cutover is declared at 09:00 on go-live day,
-    a Material Request dated that day is enforced regardless of the hour it was
-    raised. Comparing it at midnight instead would let every document raised on
-    the morning of go-live through untagged — a whole day of leakage through
-    the one gap the cutover is supposed to close. Being a few hours strict
-    costs someone two fields; being lax costs the pool its integrity.
-
-    A document with no date at all is treated as post-cutover. That only
-    happens on a malformed document, and the safe reading of "I don't know when
-    this is" is "enforce".
-    """
     date_field, time_field = DOC_DATE_FIELDS[doc.doctype]
     raw_date = doc.get(date_field)
     if not raw_date:
@@ -102,14 +71,6 @@ def is_post_cutover(doc, cutover):
 
 
 def is_exempt(doc):
-    """Stock Entries doing general warehouse work are outside this discipline.
-
-    See get_exempt_stock_entry_purposes for why the exemption exists and why
-    Material Transfer is not in it. No other doctype has an exemption: a
-    Material Request, Purchase Order or Purchase Receipt raised after the
-    cutover is always procurement for somebody, so it always has an owner and
-    a project.
-    """
     if doc.doctype != "Stock Entry":
         return False
 
@@ -118,17 +79,6 @@ def is_exempt(doc):
 
 
 def enforce_ef_project_tagging(doc, cutover_dt=None):
-    """Reject a post-cutover document missing Employee Function or Project.
-
-    Silent no-op before the cutover is declared, and for documents dated before
-    it. Enforcement is forward-only by design: nothing here backfills or
-    rejects historical data, which stays in the legacy bucket.
-
-    cutover_dt is injectable so tests can exercise both regimes without writing
-    to the live setting; production callers leave it out and get the guarded
-    accessor, which is the only read of stock_cutover_datetime that correctly
-    treats Frappe's truthy datetime(1, 1, 1) sentinel as "not set".
-    """
     config = TAGGING_FIELDS.get(doc.doctype)
     if not config:
         return
@@ -181,5 +131,4 @@ def enforce_ef_project_tagging(doc, cutover_dt=None):
 
 
 def validate_tagging(doc, method=None):
-    """doc_events entry point. Thin on purpose — all logic lives above."""
     enforce_ef_project_tagging(doc)

@@ -1,17 +1,3 @@
-"""The Unapproved GRN column: what it counts, and what it must never touch.
-
-Three properties, asserted against real site data rather than fixtures, because
-each is only meaningful in terms of how receipts are actually staged here:
-
-  1. It shows unapproved receipts only, and approval removes them by itself.
-  2. Nothing it counts has reached the Stock Ledger, so it cannot double-count
-     against any stock column.
-  3. It is display-only — no coverage arithmetic subtracts it.
-
-Run:  bench --site <site> run-tests --app custom_batch_planning \
-          --module custom_batch_planning.custom_batch_planning.doctype.batch_planning.test_unapproved_grn
-"""
-
 import unittest
 
 import frappe

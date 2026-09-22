@@ -52,16 +52,9 @@ def consolidate_items_table(doc):
         doc.calculate_taxes_and_totals()
 
 def validate_material_request(doc, method=None):
-    """Consolidate child items and remove custom_batch_reference."""
     consolidate_items_table(doc)
 
 def map_purchase_receipt_fields(doc, method=None):
-    """
-    Populate parent Purchase Receipt (GRN) `custom_batch_planning_no`
-    from the linked Purchase Order or Material Request parent header.
-
-    Also consolidate duplicate items and remove custom_batch_reference.
-    """
     consolidate_items_table(doc)
 
     if doc.get("custom_batch_planning_no"):
@@ -88,12 +81,6 @@ def map_purchase_receipt_fields(doc, method=None):
             return
 
 def map_stock_entry_fields(doc, method=None):
-    """
-    Populate parent Stock Entry `custom_batch_planning_no`
-    from the linked Purchase Receipt (GRN) parent header.
-
-    Also consolidate duplicate items and remove custom_batch_reference.
-    """
     consolidate_items_table(doc)
 
     for item in doc.items:
@@ -118,12 +105,6 @@ def map_stock_entry_fields(doc, method=None):
             doc.custom_batch_planning_no = val
 
 def map_purchase_invoice_fields(doc, method=None):
-    """
-    Populate parent Purchase Invoice `custom_batch_planning_no`
-    from the linked Purchase Receipt, Purchase Order, or Material Request.
-
-    Also consolidate duplicate items and remove custom_batch_reference.
-    """
     consolidate_items_table(doc)
 
     if doc.get("custom_batch_planning_no"):
@@ -160,10 +141,6 @@ def map_purchase_invoice_fields(doc, method=None):
             return
 
 def map_sle_fields(doc, method=None):
-    """
-    Ensure custom dimensions like batch_planning_id propagate to both legs (s_warehouse and t_warehouse)
-    of the Stock Ledger Entry for Stock Entries (e.g. Material Transfers).
-    """
     if doc.voucher_type == "Stock Entry" and doc.voucher_detail_no:
         bp_before = doc.batch_planning_id
         if not doc.batch_planning_id:

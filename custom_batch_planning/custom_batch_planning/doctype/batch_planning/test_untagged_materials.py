@@ -1,20 +1,3 @@
-"""Untagged Materials tab — predicate, project scoping, and BOM scale.
-
-The three things that decide whether this tab shows anything at all:
-
-  * UNTAGGED selects rows with no batch tag, and is disjoint from GEN and BP
-  * the Project predicate DISAPPEARS when no project is passed, and is
-    unchanged for every existing caller that passes one
-  * Qty Req is summed on the stock_qty scale, not qty_consumed_per_unit
-
-The SQL-building helpers are pure string functions, so most of this runs
-without a site. The live class at the end exercises the whole endpoint and
-skips when there is no data.
-
-Run:  bench --site <site> run-tests --app custom_batch_planning \
-          --module custom_batch_planning.custom_batch_planning.doctype.batch_planning.test_untagged_materials
-"""
-
 import unittest
 
 import frappe
@@ -29,18 +12,11 @@ from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_pl
 
 class TestUntaggedPredicate(unittest.TestCase):
     def test_untagged_matches_null_and_blank(self):
-        """NULLIF folds '' into NULL, so one IS NULL covers both."""
         sql = _bp_predicate("sle", "UNTAGGED")
         self.assertIn("NULLIF(sle.batch_planning_id, '')", sql)
         self.assertIn("IS NULL", sql)
 
     def test_untagged_honours_every_place_a_tag_can_live(self):
-        """A row whose PARENT names a Batch Planning is not untagged.
-
-        PR-2026-2027-00002 is the case that exposed this: header reads
-        BP-26-11-001, item row has no batch_planning_id at all, and the first
-        version of this predicate counted it as untagged stock.
-        """
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             MR_BP, PO_BP, PR_BP,
         )
@@ -55,7 +31,6 @@ class TestUntaggedPredicate(unittest.TestCase):
             self.assertTrue(sql.endswith("IS NULL"), sql)
 
     def test_item_level_custom_field_is_covered_where_it_exists(self):
-        """MR and PO items carry custom_batch_planning_no; PR items do not."""
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             MR_BP, PO_BP, PR_BP,
         )
@@ -64,7 +39,6 @@ class TestUntaggedPredicate(unittest.TestCase):
         self.assertNotIn("pri.custom_batch_planning_no", PR_BP)
 
     def test_untagged_takes_no_bp_parameter(self):
-        """No batch to compare against — binding one would be meaningless."""
         self.assertNotIn("%(bp)s", _bp_predicate("sle", "UNTAGGED"))
 
     def test_the_three_modes_are_disjoint(self):
@@ -80,7 +54,6 @@ class TestUntaggedPredicate(unittest.TestCase):
         self.assertNotEqual(untagged, bp)
 
     def test_existing_modes_are_untouched(self):
-        """The UNTAGGED branch must not have altered GEN or BP."""
         self.assertEqual(
             _bp_predicate("mri", "GEN"),
             "(mri.batch_planning_id IS NOT NULL "
@@ -98,7 +71,6 @@ class TestProjectClause(unittest.TestCase):
         )
 
     def test_no_project_produces_nothing(self):
-        """Not `= NULL`, which never matches — the clause must vanish entirely."""
         self.assertEqual(_project_clause("sle.project", None), "")
         self.assertEqual(_project_clause("sle.project", ""), "")
 
@@ -109,7 +81,6 @@ class TestProjectClause(unittest.TestCase):
         self.assertEqual(_project_clause(MR_PROJECT, None), "")
 
     def test_dropping_the_clause_is_what_makes_untagged_rows_visible(self):
-        """A NULL project can only be reached by removing the predicate."""
         with_project = _project_clause("sle.project", "P")
         without = _project_clause("sle.project", None)
         self.assertIn("=", with_project)
@@ -117,7 +88,6 @@ class TestProjectClause(unittest.TestCase):
 
 
 class TestUntaggedMaterialDataLive(unittest.TestCase):
-    """The whole endpoint against real data. Skips when there is none."""
 
     def _candidate(self):
         for bp in frappe.get_all(
@@ -218,7 +188,6 @@ class TestUntaggedMaterialDataLive(unittest.TestCase):
             )
 
     def test_unapproved_grn_is_never_subtracted(self):
-        """Display only — those units are already credited through Open PO."""
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             get_untagged_material_data,
         )
@@ -241,17 +210,8 @@ class TestUntaggedMaterialDataLive(unittest.TestCase):
 
 
 class TestUntaggedLabStockIsEmployeeFunctionScoped(unittest.TestCase):
-    """Lab Wise must count only THIS function's labs.
-
-    The bug this pins: untagged Lab Wise was scoped with `warehouse <> main`,
-    which under a batch tag means "this batch's labs" but with no tag means
-    "every warehouse in the company". CN02010004 read 130,500 where only 6,300
-    was in the function's own labs, and Total Stock came out identical for every
-    Employee Function because it was simply all untagged stock everywhere.
-    """
 
     def _bp_by_ef(self):
-        """Submitted Batch Plannings grouped by Employee Function."""
         out = {}
         for bp in frappe.get_all(
             "Batch Planning",
@@ -265,7 +225,6 @@ class TestUntaggedLabStockIsEmployeeFunctionScoped(unittest.TestCase):
         return out
 
     def test_lab_stock_only_counts_declared_lab_warehouses(self):
-        """Recompute independently from table_szrn and demand an exact match."""
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             _ef_lab_warehouses,
             get_untagged_material_data,
@@ -313,11 +272,6 @@ class TestUntaggedLabStockIsEmployeeFunctionScoped(unittest.TestCase):
             self.skipTest("no rows to check")
 
     def test_total_stock_differs_between_employee_functions(self):
-        """The symptom check: an EF-scoped figure must move when the EF changes.
-
-        Before the fix every function reported the same Total Stock for a shared
-        item, because the figure was the company-wide untagged total.
-        """
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             get_untagged_material_data,
         )
@@ -353,11 +307,6 @@ class TestUntaggedLabStockIsEmployeeFunctionScoped(unittest.TestCase):
 
 
 class TestLabItemBreakdown(unittest.TestCase):
-    """The drill-down must reconcile with the figure it explains.
-
-    Its only job is to let someone verify the Lab Item sum instead of trusting
-    it, so a breakdown that does not add up to the row is worse than none.
-    """
 
     def _candidate(self):
         for bp in frappe.get_all(
@@ -404,7 +353,6 @@ class TestLabItemBreakdown(unittest.TestCase):
         self.assertGreater(checked, 0)
 
     def test_every_declared_lab_is_listed_even_when_empty(self):
-        """An empty lab that was checked is not the same as a lab not checked."""
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             _ef_lab_warehouses,
             get_untagged_lab_breakdown,

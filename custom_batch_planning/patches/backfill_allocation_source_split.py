@@ -1,46 +1,8 @@
-"""Backfill local/global_allocated_qty on allocations that predate the split.
-
-DELIBERATELY NOT REGISTERED IN patches.txt. This must never run as part of a
-migrate. Run it by hand, read the dry-run report, and only then apply:
-
-    bench --site <site> execute \
-        custom_batch_planning.patches.backfill_allocation_source_split.run
-    bench --site <site> execute \
-        custom_batch_planning.patches.backfill_allocation_source_split.run \
-        --kwargs "{'apply': True}"
-
-WHY THIS IS NEEDED. Material Allocation rows created before
-check_global_free_stock_limit shipped carry allocate_qty with both split columns
-at 0. _SOURCE_COLUMN reads that pair as "no breakdown recorded" and falls back to
-counting the WHOLE reservation as local:
-
-    "local" : CASE WHEN <split> > 0 THEN local_allocated_qty ELSE allocate_qty END
-    "global": CASE WHEN <split> > 0 THEN global_allocated_qty ELSE 0 END
-
-So a legacy borrowing is charged to the borrower's own tagged stock, where the
-units never were. free_pools then leaves other_free untouched, the global pool
-keeps offering material that is already reserved, and the borrower's own figure
-goes negative to compensate — a negative that every display clamps to 0.
-
-WHAT THIS CANNOT DO. The split is not recoverable. An allocation records how much
-it took, never which pile it took it from, and the pools have moved since — stock
-received, transfers made, other allocations placed and released. This reconstructs
-what the split WOULD be if the same request were made against TODAY's pools, with
-the row's own allocation excluded so it does not compete with itself. That is a
-defensible estimate, not the historical truth, and on any item whose stock
-position has changed materially since the allocation it will be wrong.
-
-Scope is deliberately narrow: only allocations still holding stock. Deallocated
-and Stock-Entry-Done rows are already excluded by every _allocated_qty caller, so
-rewriting them would change no figure while destroying the audit trail.
-"""
-
 import frappe
 from frappe.utils import flt
 
 
 def _targets():
-    """Live allocation rows carrying no source breakdown."""
     return frappe.db.sql(
         """
         SELECT ma.name AS ma, ma.batch_planning, ma.employee_function,

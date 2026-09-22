@@ -1,16 +1,3 @@
-"""Sanity checks for the GEN / BP open-pipeline figures.
-
-GEN and BP are two disjoint pools of demand for an item under Employee Function
-+ Project: GEN is what batches OTHER than the current one have open, BP is what
-the current batch has open. No document may fall in both, which is why they are
-never summed. These tests assert that disjointness against real site data
-rather than fixtures, because it is only meaningful in terms of how
-batch_planning_id is actually tagged in the wild.
-
-Run:  bench --site <site> run-tests --app custom_batch_planning \
-          --module custom_batch_planning.custom_batch_planning.doctype.batch_planning.test_open_pipeline_split
-"""
-
 import unittest
 
 import frappe
@@ -39,7 +26,6 @@ STAGE_TABLES = {
 
 
 def _tagged_pairs(limit=60):
-    """(batch_planning_id, item_code) pairs that carry a real tag on any stage."""
     return frappe.db.sql(
         """
         SELECT bp, item FROM (
@@ -68,7 +54,6 @@ def _scope(bp_name):
 
 class TestOpenPipelineSplit(unittest.TestCase):
     def test_gen_and_bp_are_disjoint(self):
-        """No document may be reported in both GEN and BP — separate pools."""
         checked = 0
         for pair in _tagged_pairs():
             scope = _scope(pair.bp)
@@ -92,11 +77,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
         self.assertGreater(checked, 0, "no tagged data available to check")
 
     def test_gen_excludes_current_batch(self):
-        """Every doc GEN claims must be tagged to a batch OTHER than the current one.
-
-        Guards the reversal directly: under the old superset rule a document
-        tagged only to the current batch would show up in GEN.
-        """
         for pair in _tagged_pairs(limit=30):
             scope = _scope(pair.bp)
             if not scope or not scope.custom_employee_function or not scope.project:
@@ -124,7 +104,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
                     )
 
     def test_open_mr_counts_only_approved_requests(self):
-        """Draft and pending-approval MRs are not open demand and must not appear."""
         for pair in _tagged_pairs(limit=40):
             scope = _scope(pair.bp)
             if not scope or not scope.custom_employee_function or not scope.project:
@@ -147,14 +126,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
                     )
 
     def test_unapproved_po_is_not_double_counted(self):
-        """The regression the Open PO gate closed, checked across both columns.
-
-        An unapproved PO against an approved MR must (a) leave the MR in Open
-        MR, since a draft or pending PO can still be rejected or deleted, and
-        (b) not itself appear in Open PO. Before Open PO was approval-gated,
-        both were true of Open MR but the same quantity ALSO showed in Open PO
-        — one unit reported in two columns.
-        """
         rows = frappe.db.sql(
             """
             SELECT DISTINCT mri.parent AS mr, poi.parent AS po, mri.item_code,
@@ -167,12 +138,9 @@ class TestOpenPipelineSplit(unittest.TestCase):
             WHERE mri.qty > 0
               AND mr.docstatus = 1 AND mr.workflow_state LIKE 'Approve%%'
               AND mr.material_request_type = 'Purchase'
-              -- the MR must actually fall in its batch's EF + project scope,
-              -- otherwise _open_mr is right to leave it out for other reasons
               AND COALESCE(NULLIF(mri.employee_function,''),
                            NULLIF(mr.custom_employee_function,'')) = bpl.custom_employee_function
               AND COALESCE(NULLIF(mri.project,''), NULLIF(mr.project,'')) = bpl.project
-              -- covered by at least one PO, but by no APPROVED one
               AND NOT EXISTS (
                   SELECT 1 FROM `tabPurchase Order Item` poi2
                   JOIN `tabPurchase Order` po2 ON po2.name = poi2.parent
@@ -203,7 +171,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
             )
 
     def test_bp_bucket_contains_only_this_batch_documents(self):
-        """Every doc BP claims must carry a row tagged to exactly that batch."""
         for pair in _tagged_pairs(limit=30):
             scope = _scope(pair.bp)
             if not scope or not scope.custom_employee_function or not scope.project:
@@ -228,7 +195,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
                     )
 
     def test_open_mr_excludes_non_purchase_requests(self):
-        """Material Transfer / Issue / Manufacture MRs are not procurement demand."""
         for pair in _tagged_pairs(limit=40):
             scope = _scope(pair.bp)
             if not scope or not scope.custom_employee_function or not scope.project:
@@ -249,7 +215,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
                     )
 
     def test_open_po_counts_only_approved_orders(self):
-        """Draft and pending-approval POs are not commitments and must not appear."""
         for pair in _tagged_pairs(limit=40):
             scope = _scope(pair.bp)
             if not scope or not scope.custom_employee_function or not scope.project:
@@ -272,11 +237,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
                     )
 
     def test_open_po_ignores_unapproved_receipts(self):
-        """A PO is only retired from Open PO by a Store-Head-approved receipt.
-
-        A draft or pending GRN can still be rejected or deleted, so a PO it
-        covers must remain visible in the column.
-        """
         rows = frappe.db.sql(
             """
             SELECT DISTINCT poi.parent AS po, poi.item_code, poi.batch_planning_id AS bp,
@@ -292,7 +252,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
                            NULLIF(po.employee_function,''),
                            NULLIF(po.custom_employee_functions,'')) = bpl.custom_employee_function
               AND COALESCE(NULLIF(poi.project,''), NULLIF(po.project,'')) = bpl.project
-              -- receipted at least once, but by no APPROVED receipt
               AND NOT EXISTS (
                   SELECT 1 FROM `tabPurchase Receipt Item` pri2
                   JOIN `tabPurchase Receipt` pr2 ON pr2.name = pri2.parent
@@ -316,7 +275,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
             )
 
     def test_doc_count_matches_doc_list(self):
-        """The count returned must equal the number of distinct docs returned."""
         for pair in _tagged_pairs(limit=30):
             scope = _scope(pair.bp)
             if not scope or not scope.custom_employee_function or not scope.project:
@@ -338,7 +296,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
                     self.assertGreaterEqual(qty, 0, f"{stage}/{mode} qty must never be negative")
 
     def test_bp_bucket_is_not_always_empty(self):
-        """Guard against the BP query silently matching nothing forever."""
         found = False
         for pair in _tagged_pairs(limit=120):
             scope = _scope(pair.bp)
@@ -357,7 +314,6 @@ class TestOpenPipelineSplit(unittest.TestCase):
 
 
 def _planning_batches(limit=8):
-    """Batch Plannings that have both a scope and BOM rows worth reporting on."""
     return frappe.db.sql(
         """
         SELECT DISTINCT bp.name, bp.custom_employee_function AS ef, bp.project
@@ -376,10 +332,8 @@ def _planning_batches(limit=8):
 
 
 class TestStockColumnScopes(unittest.TestCase):
-    """Main Wh / Total Stock / Allocated / Lab Wise / Free Qty scoping rules."""
 
     def test_main_wh_gen_excludes_current_batch(self):
-        """GEN Main Wh must never include stock tagged to the current batch."""
         checked = 0
         for row in _planning_batches():
             warehouse = _store_warehouse(row.ef)
@@ -417,7 +371,6 @@ class TestStockColumnScopes(unittest.TestCase):
         self.assertGreater(checked, 0, "no tagged stock available to check")
 
     def test_global_main_wh_equals_gen_plus_bp(self):
-        """GEN and BP are disjoint, so together they must be the tagged total."""
         for row in _planning_batches():
             warehouse = _store_warehouse(row.ef)
             if not warehouse:
@@ -444,7 +397,6 @@ class TestStockColumnScopes(unittest.TestCase):
                 )
 
     def test_bp_predicate_modes_never_overlap_on_stock(self):
-        """The same disjointness the pipeline relies on must hold for SLE rows."""
         gen_sql = _bp_predicate("sle", "GEN")
         bp_sql = _bp_predicate("sle", "BP")
         for row in _planning_batches(limit=4):
@@ -460,7 +412,6 @@ class TestStockColumnScopes(unittest.TestCase):
             )
 
     def test_global_free_qty_identity_holds_exactly(self):
-        """Global Main Wh = Global Free Qty + Global Allocated, to the penny."""
         checked = 0
         pending = 0
         for row in _planning_batches():
@@ -485,7 +436,6 @@ class TestStockColumnScopes(unittest.TestCase):
             )
 
     def test_free_qty_is_pending_until_cutover_is_declared(self):
-        """No global figure may be invented before the go-live marker is set."""
         cutover = get_stock_cutover_datetime()
         for row in _planning_batches(limit=3):
             payload = get_material_planning_data(row.name)
@@ -507,11 +457,6 @@ class TestStockColumnScopes(unittest.TestCase):
                     self.assertIsNone(r["global_main_stock"])
 
     def test_global_main_wh_is_cutover_scoped_not_gen_plus_bp(self):
-        """Global Main Wh carries the date cutoff; GEN/BP deliberately do not.
-
-        It must equal an independent post-cutover sum, and it must never
-        include a pre-cutover row that GEN or BP would still show.
-        """
         cutover = get_stock_cutover_datetime()
         if not cutover:
             self.skipTest("stock cutover not declared")
@@ -546,7 +491,6 @@ class TestStockColumnScopes(unittest.TestCase):
                 )
 
     def test_legacy_bucket_is_never_inside_global_main_wh(self):
-        """The frozen bucket must stay strictly outside the planning figure."""
         cutover = get_stock_cutover_datetime()
         for row in _planning_batches(limit=3):
             warehouse = _store_warehouse(row.ef)
@@ -573,7 +517,6 @@ class TestStockColumnScopes(unittest.TestCase):
                 )
 
     def test_total_stock_is_asymmetric(self):
-        """BP Total = BP Main + Lab Wise; GEN Total = GEN Main, with no GEN Lab."""
         for row in _planning_batches():
             for r in get_material_planning_data(row.name)["results"]:
                 self.assertAlmostEqual(
@@ -591,7 +534,6 @@ class TestStockColumnScopes(unittest.TestCase):
                 )
 
     def test_columns_without_a_gen_split_do_not_gain_one(self):
-        """Allocated, Lab Wise and Free Qty must expose no GEN/BP variants."""
         forbidden = {
             "gen_allocated_qty", "bp_allocated_qty",
             "gen_lab_stock", "bp_lab_stock",
@@ -610,7 +552,6 @@ class TestStockColumnScopes(unittest.TestCase):
                     self.assertIn(key, r, f"{key} missing for {r['item_code']}")
 
     def test_bp_allocated_is_batch_scoped_and_within_global(self):
-        """BP Allocated is one batch's slice of the pool-wide reservation."""
         checked = 0
         for row in _planning_batches():
             for r in get_material_planning_data(row.name)["results"]:
@@ -632,7 +573,6 @@ class TestStockColumnScopes(unittest.TestCase):
 
 
 def _store_warehouse(employee_function):
-    """Resolved exactly the way get_material_planning_data resolves it."""
     ef_doc = frappe.get_doc("Employee Function", employee_function)
     for r in (ef_doc.table_bukm or []):
         if r.store_warehouse:

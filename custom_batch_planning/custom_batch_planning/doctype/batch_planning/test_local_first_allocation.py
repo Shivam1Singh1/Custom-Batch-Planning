@@ -1,14 +1,3 @@
-"""The allocation priority rule: local free stock first, global second.
-
-split_local_first is the one place that rule lives. Both the proposal built by
-create_bulk_material_allocations and the save-time enforcement in
-Material Allocation.check_global_free_stock_limit run through it, so asserting
-it here covers both paths.
-
-Run:  bench --site <site> run-tests --app custom_batch_planning \
-          --module custom_batch_planning.custom_batch_planning.doctype.batch_planning.test_local_first_allocation
-"""
-
 import unittest
 
 from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (

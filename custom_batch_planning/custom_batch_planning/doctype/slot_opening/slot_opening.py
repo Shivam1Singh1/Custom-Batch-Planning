@@ -38,24 +38,6 @@ def get_sct_details(slot_master=None, date=None):
 
 @frappe.whitelist()
 def get_slot_opening_usage(slot_opening=None):
-    """Per date: how many of THIS Slot Opening's booked slots are still unused.
-
-    Slot Capacity Detail.batches_planned cannot answer this. It is keyed on
-    (slot master, date) alone, so every batch planned against that date
-    increments it no matter which Slot Opening produced it. Comparing that
-    shared counter against one Slot Opening's own planning_capacity — which is
-    what the Create Batch button used to do — makes a neighbour's batch consume
-    this opening's button: two slots on a date, another opening plans one, and
-    this one is told it is full while holding an untouched booking.
-
-    Counted from the batches themselves instead. Batches Planned carries the
-    Batch Planning that made it, and Batch Planning carries the Slot Opening it
-    came from, so the chain back to one opening is exact and needs no counter to
-    stay in step. Cancelled batches (docstatus 2) do not hold a slot.
-
-    Returns one row per booked date:
-        date, booked, planned, remaining
-    """
     if not slot_opening:
         return []
 

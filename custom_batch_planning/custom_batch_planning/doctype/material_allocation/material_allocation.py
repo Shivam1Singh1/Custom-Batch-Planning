@@ -34,34 +34,6 @@ class MaterialAllocation(Document):
                 )
 
     def set_pool_flags(self):
-        """Stamp the two hidden pool flags from the rows.
-
-        Both are DERIVED, never entered, and recomputed on every save — a stored
-        flag that can disagree with the rows it summarises is the same trap
-        Material Allocation Log fell into.
-
-        Runs after check_global_free_stock_limit so it reads the split that
-        method just wrote, not whatever the client sent.
-
-        has_untagged_items answers "does this allocation touch the untagged
-        pool", for filtering and reporting.
-
-        requires_material_request answers the operational question, and it is
-        NOT the inverse of the first. An untagged allocation still needs a
-        transfer for its MAIN-sourced share: that stock is sitting in the store
-        and has to physically reach the lab. Only the lab-sourced share moves
-        nothing, because those units are already standing in the lab.
-
-            all lab-sourced untagged   -> nothing to move, no request
-            part main-sourced untagged -> the main share must move
-            tagged                     -> the whole reservation must move
-
-        Hiding the request button on every untagged allocation would strand the
-        main-sourced quantity: reserved indefinitely, with no way to move it.
-        This flag is exactly the condition under which make_material_request
-        would raise "No allocated quantities to transfer", so the button and the
-        server agree instead of the button offering an action that throws.
-        """
         has_untagged = False
         transferable = 0.0
 
@@ -79,13 +51,6 @@ class MaterialAllocation(Document):
         self.requires_material_request = 1 if transferable > 0 else 0
 
     def clear_source_split(self):
-        """Blank the source breakdown when it cannot be derived server-side.
-
-        The four split fields are read-only on the form but still arrive in the
-        payload, so leaving whatever the client sent in place would present an
-        unverified split as if the server had computed it. Zero is the honest
-        answer when there is no pool to compute against.
-        """
         for item in self.material_allocation:
             item.local_free_qty = 0
             item.global_free_qty = 0
@@ -95,42 +60,6 @@ class MaterialAllocation(Document):
             item.main_allocated_qty = 0
 
     def check_global_free_stock_limit(self):
-        """Re-read the free pools at save time, enforce local-first, refuse to
-        over-issue.
-
-        Allocation priority is enforced here, not in the UI: this batch's own
-        free stock is consumed in full before any global stock is touched, and
-        the resulting local/global breakdown is written back onto every row.
-        Requested 100 against 40 local and 80 global saves as 40 local + 60
-        global; requested 30 against the same pools saves as 30 local + 0
-        global. Whatever split the client sent is discarded.
-
-        The confirmation dialog on the Batch Planning form is advisory only: it
-        reflects the pools as they stood when Material Planning was last run. By
-        the time this document is saved another allocation may have consumed
-        the same units, so the figure the user agreed to cannot be trusted and
-        is deliberately not sent back to the server.
-
-        Rows are locked FOR UPDATE while the pools are read, so two allocations
-        racing for the last units serialise instead of both passing.
-
-        This document is excluded from the totals it is being checked against —
-        on a re-save it is already in the table, and counting it would make it
-        compete with itself.
-
-        TWO POOLS, CHOSEN PER ROW BY source_pool. Tagged rows are checked
-        exactly as they always were, against the batch-tagged pools
-        free_stock_figures measures. Untagged rows are checked against the
-        untagged pile instead — untagged_free_figures — and split LAB FIRST
-        rather than local first.
-
-        The pools must never be mixed, in either direction. Checking an untagged
-        row against the tagged pools reads ~0 free and rejects an allocation
-        that is fully covered; checking a tagged row against the untagged pile
-        offers it stock that was never claimed by batch planning. Rows carrying
-        no source_pool are legacy tagged rows — see _POOL_COLUMN — so the
-        default here must stay "Tagged".
-        """
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             _ef_lab_warehouses,
             free_stock_figures,
@@ -298,31 +227,6 @@ class MaterialAllocation(Document):
 
     @frappe.whitelist()
     def auto_allocate(self):
-        """
-        Auto Allocate Flow:
-        1. Fetch warehouse from Employee Function.
-        2. FEFO based batch allocation.
-        3. Fallback for non-batch items.
-
-        TAGGED AND UNTAGGED ROWS SCAN DIFFERENT WAREHOUSES. A tagged row is
-        filled from the store, as it always was. An untagged row is filled in
-        two passes — its lab-sourced portion from the Employee Function's lab
-        warehouses, its main-sourced portion from the store — because that is
-        where each portion was reserved.
-
-        Filling an untagged row entirely from the store would name store batches
-        for units physically standing in a lab, and would leave the lab-sourced
-        portion with no batch rows at all. That second failure is not cosmetic:
-        get_batches subtracts MA Batch Detail quantities held by other live
-        allocations, so a portion that writes no rows is invisible to the
-        batch-level double-reservation guard.
-
-        NOT an expiry check on the pool. get_batches skips disabled and expired
-        batches, so nothing expired is NAMED here — but the untagged stock
-        queries apply no expiry filter, so those units were already counted as
-        free and offered on the tab. Closing that gap moves Free Qty and is a
-        separate decision (deferred 2026-09-07).
-        """
         from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
             _ef_lab_warehouses,
             split_lab_first,
@@ -410,7 +314,6 @@ class MaterialAllocation(Document):
         return True
 
     def _bin_qty(self, item_code, warehouses):
-        """Actual qty across a set of warehouses, from Bin."""
         if not warehouses:
             return 0.0
         rows = frappe.db.get_all(
@@ -421,19 +324,6 @@ class MaterialAllocation(Document):
         return sum(flt(q) for q in rows)
 
     def _fill_from_batches(self, item, warehouses, qty_needed):
-        """FEFO-fill batch_details for ONE portion of a row. Returns qty covered.
-
-        Split out of auto_allocate because an untagged row has two portions
-        drawn from two different places, and each must be filled from the
-        warehouses it was actually reserved against. Filling the whole row from
-        the store would name store batches for units standing in a lab.
-
-        Appends to batch_details rather than replacing it, so the caller can run
-        it twice for one row. MA Batch Detail carries no warehouse column, so
-        the two passes are indistinguishable once written — acceptable because
-        batch_no identifies the material, and get_batches reads the rows back
-        purely to avoid double-reserving a batch.
-        """
         qty_needed = flt(qty_needed)
         if qty_needed <= 0 or not warehouses:
             return 0.0
@@ -456,14 +346,6 @@ class MaterialAllocation(Document):
         return total
 
     def get_linked_stock_entry(self):
-        """
-        Returns the live Stock Entry linked to this allocation, or None.
-
-        The link lives on this side (`stock_entry`) rather than on Stock Entry,
-        so a cancelled Stock Entry leaves a stale pointer behind. Treat a
-        cancelled Stock Entry as no link at all and clear it, which is what
-        frees the allocation up for a fresh transfer.
-        """
         if not self.stock_entry:
             return None
 
@@ -477,14 +359,6 @@ class MaterialAllocation(Document):
         return se
 
     def get_linked_material_request(self):
-        """
-        Returns the live Material Request raised from this allocation, or None.
-
-        Same self-healing shape as get_linked_stock_entry: the link lives on
-        this side (`material_request`), so a cancelled Material Request leaves a
-        stale pointer behind. A cancelled request is treated as no link at all
-        and cleared, which frees the allocation to raise a fresh one.
-        """
         if not self.material_request:
             return None
 
@@ -502,37 +376,6 @@ class MaterialAllocation(Document):
 
     @frappe.whitelist()
     def deallocate(self):
-        """Release this allocation's hold, whichever pool it drew on.
-
-        ONE MECHANISM SERVES BOTH POOLS, and that is by design rather than by
-        omission. What releases stock is the status: allocation_status becomes
-        "Deallocated", and every figure in the app that means "still holding
-        stock" filters it out by the same rule — _allocated_qty for the tagged
-        pools, _untagged_allocated_qty for the untagged pile, the guards in
-        check_batch_planning_allocation_limit and _bp_allocated_by_item. Flip the
-        status and Free Qty rises on whichever tab was counting the reservation.
-
-        THE LAB-SOURCED PORTION NEEDS NO LEDGER REVERSAL. This is the part that
-        looks like a missing step and is not. Allocating untagged lab stock posts
-        nothing: those units were already standing in the lab, so the claim was
-        recorded on this document and nowhere else. There is no Stock Entry to
-        cancel, no Stock Ledger row to reverse, and adding one here would invent
-        a movement that never happened. Releasing the claim IS the whole
-        reversal.
-
-        The main-sourced portion behaves exactly like a tagged reservation: the
-        stock never left the store, so releasing the claim returns it to the
-        untagged pool with nothing to undo. If it had already been transferred,
-        the Stock Entry guard below refuses the deallocation until that entry is
-        cancelled — and cancelling it reverses the tagged ledger rows, which is
-        what puts the units back in the untagged pile.
-
-        The guards therefore need no pool awareness. An allocation covered
-        entirely from lab stock can never have a Material Request in the first
-        place: make_material_request skips lab-sourced quantity, so a fully
-        lab-sourced allocation raises "nothing to transfer" instead of a request.
-        Both checks below simply never fire for it.
-        """
         if self.docstatus == 2:
             frappe.throw("Document is cancelled.")
 
@@ -579,57 +422,6 @@ class MaterialAllocation(Document):
 
     @frappe.whitelist()
     def make_material_request(self):
-        """
-        Builds the Material Transfer request for this allocation and returns it
-        UNSAVED, for the client to open as a new form.
-
-        Nothing is written here - no insert, no draft, no link stamped. The
-        request comes into existence only when the user presses Save on the
-        form, which is also where Stage and Project Description get filled in:
-        both are reqd on Material Request and neither can be derived from
-        anything on this side, so Frappe's own mandatory check on the form is
-        what collects them. Returning an unsaved doc is ERPNext's own make_*
-        mapper shape - see make_stock_entry in the Material Request doctype.
-
-        Because the request has no name yet, the link back to this allocation
-        cannot be stamped here. `custom_material_allocation` on the returned
-        doc carries it instead, and stamp_material_allocation in api/ma_link.py
-        writes `material_request` back on save. Everything that reads that link
-        - the one-request-per-allocation check below, the deallocate guard -
-        keeps working, one Save later than it used to.
-
-        The Stock Entry is deliberately NOT built here. Once this request is
-        submitted the user presses ERPNext's own Create > Stock Entry on it,
-        which runs make_stock_entry in erpnext/stock/doctype/material_request.
-        Going through the stock mapper rather than a second hand-rolled builder
-        is what makes the target warehouse the user picks, the batch selection
-        and the qty-already-transferred arithmetic all behave the way they do
-        everywhere else in ERPNext.
-
-        UNTAGGED ROWS TRANSFER ONLY THEIR MAIN-STORE PORTION. The mechanism
-        below is unchanged — same mapper, same warehouse pair, same tagging —
-        but the quantity for a row drawn from the untagged pool is
-        main_allocated_qty, not allocate_qty. Its lab-sourced half is already
-        standing in the lab warehouse: those units were allocated where they
-        sat, and no ledger movement was ever meant to post for them. Requesting
-        the whole reservation would move stock out of a store that does not hold
-        it, and would deliver into the lab a second copy of what is already
-        there. Tagged rows are untouched — they carry no untagged split and
-        transfer their whole reservation exactly as before.
-
-        An allocation covered entirely from lab stock therefore has nothing to
-        request, and says so rather than raising an empty transfer.
-
-        Warehouse direction, because ERPNext's field names invite getting this
-        backwards: `set_from_warehouse` is the SOURCE, taken from the Employee
-        Function's store warehouse, and `set_warehouse` is the TARGET, taken
-        from its lab warehouse - the same pair the Stock Entry builder this
-        replaces used. Both sides are filled rather than left blank because
-        validate_stock_item_warehouse in erpnext/buying/utils.py throws
-        "Warehouse is mandatory for stock Item" on any row for a stock item
-        with no target. Either can still be changed on the form before saving -
-        which matters, because an Employee Function commonly lists several labs.
-        """
         if self.docstatus != 1:
             frappe.throw("Submit the Material Allocation first.")
 
@@ -710,7 +502,6 @@ class MaterialAllocation(Document):
         return mr
 
     def save_allocation_log(self, status):
-        """Logs the allocation/deallocation activity to 'Material Allocation Log'."""
         existing = frappe.db.get_value(
             "Material Allocation Log",
             {"batch_planning": self.batch_planning},
@@ -789,20 +580,6 @@ class MaterialAllocation(Document):
         return None
 
     def get_employee_function_defaults(self):
-        """
-        The Material Request values only the Employee Function knows: both
-        warehouses, the segment, the cost centre and the function head's name.
-
-        Read together off one document rather than a method per field, because
-        an insert needs all four at once - segment and cost_center are reqd on
-        Material Request Item, so one missing value fails the whole request
-        rather than a single row.
-
-        Where a child table holds several rows the one flagged `default` wins
-        and the first row is the fallback. That fallback is what the Stock
-        Entry builder this replaces did for the warehouses, and it is the
-        reason the target warehouse is worth a second look on the draft.
-        """
         ef_doc = frappe.get_doc("Employee Function", self.employee_function)
 
         def pick(table, fieldname):
@@ -821,19 +598,6 @@ class MaterialAllocation(Document):
         })
 
     def get_batches(self, item_code, warehouses):
-        """Fetch batches with FEFO logic and exclude existing allocations.
-
-        `warehouses` is a LIST. It used to be a single warehouse, because the
-        only pool that could be allocated from was the Employee Function's
-        store. Untagged allocation draws on the lab warehouses as well, and a
-        row's lab-sourced portion has to be filled from the labs that actually
-        hold it — so the scope is now a set, and an empty one means there is
-        nowhere to look rather than every warehouse in the company.
-
-        FEFO still runs across the whole set at once rather than warehouse by
-        warehouse: the nearest expiry should be consumed first wherever it is
-        standing, which is the entire point of the ordering.
-        """
         if not warehouses:
             return []
         return frappe.db.sql("""
@@ -912,21 +676,6 @@ def ma_get_allocated_qty(item_code, employee_function, batch_planning, project, 
 
 @frappe.whitelist()
 def ma_get_untagged_free(item_code, employee_function, batch_planning, exclude_parent=None):
-    """Untagged pool figures for one row, for the form's live refresh.
-
-    The untagged twin of ma_get_allocated_qty. It exists because that function
-    answers a different question: it routes through free_stock_figures, which
-    measures the batch-TAGGED pools. Asking it about a row drawn from the
-    untagged pile returns the wrong pool's numbers, and the form was overwriting
-    the builder's figures with them the moment the draft opened - an item with
-    51,300 free untagged units displayed as 9,850, and items with thousands free
-    displayed as 0.
-
-    Returns the two halves separately as well as their sum, because the form
-    needs the lab half to reproduce the lab-first split when the user edits Qty
-    Requested. Both are clamped at zero here rather than in the client, so the
-    two ends cannot disagree about what a negative half means.
-    """
     from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
         _ef_lab_warehouses,
         untagged_free_figures,
@@ -1028,39 +777,10 @@ def get_item_batch_expiry(item_codes):
     return result
 
 def stock_entry_on_submit(doc, method=None):
-    """doc_events hook for Stock Entry on_submit."""
     on_stock_entry_submit(doc.name)
 
 
 def _allocation_for_stock_entry(stock_entry_name):
-    """
-    The Material Allocation a submitted Stock Entry belongs to, or None.
-
-    Two routes, tried in that order:
-
-    1. `stock_entry` on the allocation. This is only ever set by route 2 now,
-       but it is also how every transfer made before the Material Request step
-       existed is linked, so it stays the first thing checked.
-
-    2. Through the Material Request. Stock Entries are no longer built here -
-       the user raises a request and presses ERPNext's Create > Stock Entry,
-       and make_stock_entry maps the request onto `material_request` on each
-       Stock Entry Detail row (the parent has no such field, only the child
-       does). That row points back at the request the allocation owns.
-
-    Without route 2 nothing would connect the two documents and the allocation
-    would never leave "Allocated". That is not a cosmetic problem: every free
-    stock figure in this app, in batches_planned and in batch_planning, treats
-    "Allocated" as the status that holds stock — see _HOLDS_STOCK in
-    batch_planning.py — so a completed transfer would keep its quantities
-    reserved forever and the over-allocation guard would refuse work that is
-    actually free.
-
-    The BOM ceiling is the one exception and reads wider on purpose:
-    check_batch_planning_allocation_limit and _bp_allocated_by_item still use
-    `allocation_status NOT IN ('Deallocated', 'Stock Entry Done')`, so that
-    unallocated drafts still count against Qty Required.
-    """
     ma_name = frappe.db.get_value(
         "Material Allocation", {"stock_entry": stock_entry_name}, "name"
     )
@@ -1085,11 +805,6 @@ def _allocation_for_stock_entry(stock_entry_name):
 
 @frappe.whitelist()
 def on_stock_entry_submit(stock_entry_name):
-    """
-    Called when a Stock Entry belonging to a Material Allocation is submitted.
-    Updates allocation_status to 'Stock Entry Done' and back-fills the
-    `stock_entry` link so the allocation can still offer "Open Stock Entry".
-    """
     ma_name = _allocation_for_stock_entry(stock_entry_name)
     if not ma_name:
         return
@@ -1109,45 +824,6 @@ def on_stock_entry_submit(stock_entry_name):
 
 @frappe.whitelist()
 def get_allocated_items(batch_planning, employee_function):
-    """Every item allocated against this Batch Planning, for View Allocations.
-
-    READ FROM THE ALLOCATIONS THEMSELVES, not from Material Allocation Log.
-
-    The log's ma_logs rows are a hand-maintained running tally:
-    save_allocation_log adds a row on allocate, subtracts on deallocate, clamps
-    at zero, and this used to filter for qty_allocated > 0. Every one of those
-    steps is a chance to drift, and it did — the dialog announced "4 Material
-    Allocation(s) have been done" while listing one item, because rows for the
-    other items had been decremented away or never written. A derived tally that
-    can disagree with the documents it describes is worse than no tally, since
-    the number still looks authoritative.
-
-    Material Allocation Item is the record of what was allocated. Summing it
-    cannot drift, and the count and the list are now built from the same query,
-    so the header can no longer contradict the table beneath it.
-
-    WHAT COUNTS: approved allocations that actually allocated something.
-
-        workflow_state  = 'Approved'                     — no drafts
-        allocation_status IN ('Allocated', 'Material Request Done',
-                              'Stock Entry Done')
-        docstatus      <> 2                              — no cancellations
-
-    Deallocated is excluded by that IN list: it was released deliberately and
-    holds nothing.
-
-    Stock-Entry-Done is INCLUDED, which is the important difference from the
-    free-stock queries (_HOLDS_STOCK). Those ask "what is still reserved"; this
-    asks "what has this plan been given". Material already transferred into the
-    lab is the clearest case of an allocation that was done, and hiding it is
-    what made completed items look unallocated on this plan.
-
-    NOT gated on docstatus for the draft test. Allocations in this app reach
-    workflow_state "Approved" and allocation_status "Allocated" while still at
-    docstatus 0 — auto_allocate requires Approved but does not submit — so
-    excluding docstatus 0 would drop live allocations. workflow_state is the
-    field that actually distinguishes a draft here.
-    """
     LIVE = """
           AND ma.batch_planning = %(bp)s
           AND ma.employee_function = %(ef)s

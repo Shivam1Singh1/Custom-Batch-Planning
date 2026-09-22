@@ -1,18 +1,3 @@
-"""
-Keeps `Material Allocation.material_request` in step with the request the user
-actually saves.
-
-Material Allocation.make_material_request hands the client an unsaved Material
-Request, so no name exists at build time and the allocation cannot be stamped
-there. The unsaved doc carries `custom_material_allocation` instead; this fires
-on insert and writes the link back.
-
-Only the stamping direction needs a hook. A request that is later cancelled or
-deleted leaves a stale pointer behind, and get_linked_material_request on the
-allocation already clears that on read - so there is deliberately no on_cancel
-or on_trash handler here to be kept in sync with it.
-"""
-
 import frappe
 
 

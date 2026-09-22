@@ -1,20 +1,3 @@
-"""The Allocated column across allocate -> transfer, and the Net Req it feeds.
-
-Pins three things that were agreed explicitly and are easy to regress:
-
-  * the GLOBAL line reconciles in every state, the CURRENT line does not, and
-    the failure is bounded — it is off by exactly the borrowed quantity
-  * a transfer clears the reservation from the pool it was drawn from, while
-    Free Qty stays put
-  * Net Req credits the borrowed draw ONLY, never the local one
-
-Pure arithmetic over free_pools / settle_cross_batch_draw / split_local_first,
-so it runs without a site.
-
-Run:  bench --site <site> run-tests --app custom_batch_planning \
-          --module custom_batch_planning.custom_batch_planning.doctype.batch_planning.test_allocated_column_lifecycle
-"""
-
 import unittest
 
 from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_planning import (
@@ -25,7 +8,6 @@ from custom_batch_planning.custom_batch_planning.doctype.batch_planning.batch_pl
 
 
 def _view(bp_main, other_main, bp_loc, bp_glob, oth_loc=0, oth_glob=0):
-    """The five figures the Material Planning row actually shows, post-settle."""
     bp_main, other_main = settle_cross_batch_draw(bp_main, other_main)
     pools = free_pools(bp_main, bp_loc, bp_glob, other_main, oth_loc, oth_glob)
     return {
@@ -45,21 +27,18 @@ def _global_closes(v):
 
 
 def _pool_invariant_holds(v):
-    """bp_main = bp_local_allocated + other_global_allocated + bp_free."""
     return abs(
         v["current_main"] - (v["bp_local"] + v["other_global"] + v["current_free"])
     ) < 1e-9
 
 
 def net_req(qty_required, total_stock, bp_global_allocated, open_mr=0.0, open_po=0.0):
-    """Net Req as implemented: only the borrowed draw is credited."""
     return max(
         qty_required - total_stock - bp_global_allocated - open_mr - open_po, 0.0
     )
 
 
 class TestScenario1LocalDraw(unittest.TestCase):
-    """Batch owns 100, others own 90. It reserves 40 of its own, then moves it."""
 
     def test_split_is_entirely_local(self):
         row = split_local_first([40], 100, 90)["rows"][0]
@@ -98,7 +77,6 @@ class TestScenario1LocalDraw(unittest.TestCase):
 
 
 class TestScenario2GlobalDraw(unittest.TestCase):
-    """Batch owns 0, others own 90. It borrows 10, then moves it."""
 
     def test_split_is_entirely_global(self):
         row = split_local_first([10], 0, 90)["rows"][0]
@@ -140,7 +118,6 @@ class TestScenario2GlobalDraw(unittest.TestCase):
 
 
 class TestScenario3LegacyRowWithNoSplit(unittest.TestCase):
-    """The shipped bug: both split columns 0 means the whole draw reads local."""
 
     def test_missing_split_hides_the_draw_from_the_global_pool(self):
         correct = _view(0, 90, 0, 10)
@@ -157,7 +134,6 @@ class TestScenario3LegacyRowWithNoSplit(unittest.TestCase):
 
 
 class TestNetRequirement(unittest.TestCase):
-    """Only the borrowed draw is credited; the local one is inside Total Stock."""
 
     def test_local_allocation_is_not_credited_twice(self):
         self.assertEqual(net_req(100, 40 + 0, 10), 50)
@@ -168,7 +144,6 @@ class TestNetRequirement(unittest.TestCase):
         self.assertEqual(net_req(100, 40, 10) - old, 40)
 
     def test_grouping_lab_into_total_stock_is_not_the_fix(self):
-        """The rejected proposal is the old formula rearranged."""
         proposal = max(100 - (40 + 0) - (40 + 10), 0.0)
         self.assertEqual(proposal, max(100 - 40 - 0 - 10 - 40, 0.0))
 
